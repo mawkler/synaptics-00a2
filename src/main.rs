@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Userspace driver for the Synaptics 06cb:00a2 fingerprint reader
 
-mod blobs;
-mod calibrate;
-mod capture;
-mod pairing;
-mod prog;
-mod proto;
-mod tables;
-mod tls;
-mod usb;
-
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -27,6 +17,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use syna_00a2::{blobs, calibrate, capture, matcher, pairing, proto, tables, tls, usb};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -109,6 +100,16 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Offline: scores probe images against a template built from enrolled
+    /// images, as the driver's matcher does. Prints scores only.
+    Score {
+        /// 112×112 PGMs to build the template from
+        #[arg(long, num_args = 1.., required = true)]
+        enroll: Vec<PathBuf>,
+        /// 112×112 PGMs to score
+        #[arg(long, num_args = 1.., required = true)]
+        probe: Vec<PathBuf>,
+    },
 }
 
 type Decoder = fn(&[u8]) -> Result<Value>;
@@ -150,6 +151,7 @@ fn main() -> Result<()> {
         } => with_sensor(&serial_file, output, |sensor, keys, steps| {
             run_calibrate(sensor, keys, steps, &out_dir)
         }),
+        Command::Score { enroll, probe } => score(&enroll, &probe),
         Command::Capture {
             serial_file,
             out_dir,
@@ -624,6 +626,34 @@ fn run_capture(
     }
     steps.insert("captures".into(), json!(captures));
     failure.map_or(Ok(()), Err)
+}
+
+fn score(enroll: &[PathBuf], probes: &[PathBuf]) -> Result<()> {
+    let template = matcher::Template { images: enroll.iter().map(|p| read_pgm(p)).collect::<Result<_>>()? };
+    let started = std::time::Instant::now();
+    let matcher = matcher::Matcher::new(&template);
+    for path in probes {
+        let score = matcher.score(&read_pgm(path)?);
+        println!("{:.3} {}", score, path.file_name().unwrap_or_default().to_string_lossy());
+    }
+    eprintln!(
+        "{} probes against {} images in {:.2} s; threshold {}",
+        probes.len(),
+        template.images.len(),
+        started.elapsed().as_secs_f64(),
+        matcher::THRESHOLD
+    );
+    Ok(())
+}
+
+/// Pixels of a 112×112 8-bit binary PGM as written by `pgm`
+fn read_pgm(path: &Path) -> Result<Vec<u8>> {
+    let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let header = format!("P5\n{0} {0}\n255\n", matcher::SIDE);
+    ensure!(data.starts_with(header.as_bytes()), "{} is not a 112×112 PGM from this tool", path.display());
+    let pixels = data[header.len()..].to_vec();
+    ensure!(pixels.len() == matcher::SIDE * matcher::SIDE, "{} is truncated", path.display());
+    Ok(pixels)
 }
 
 fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
