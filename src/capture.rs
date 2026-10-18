@@ -46,6 +46,14 @@ pub struct Image {
     pub pixels: Vec<u8>,
 }
 
+pub enum Scan {
+    Image(Image),
+    /// The scan completed, but the result header carries this error code,
+    /// e.g. 0x80000 (M4d). python-validity retries the placement, so callers
+    /// should too.
+    Rejected(u32),
+}
+
 pub struct Capture<'a> {
     pub session: &'a mut Session,
     pub sensor: &'a Sensor,
@@ -97,25 +105,26 @@ impl<'a> Capture<'a> {
     }
 
     /// Runs one scan with `command`, waiting up to `finger_timeout` for a
-    /// finger. An interrupted scan gets `0x04` (capture stop); a completed one
-    /// does not, as python-validity says the 00a2 rejects it then.
+    /// finger. An interrupted or rejected scan gets `0x04` (capture stop), as
+    /// in python-validity; a completed one does not, as python-validity says
+    /// the 00a2 rejects it then.
     pub fn scan(
         &mut self,
         command: &[u8],
         finger_timeout: Duration,
         on_ready: impl FnOnce(),
-    ) -> Result<Image> {
+    ) -> Result<Scan> {
         self.started = Instant::now();
         self.session.cmd_ok(self.sensor, command)?;
         let result = self.follow(finger_timeout, on_ready);
-        if result.is_err() {
+        if !matches!(result, Ok(Scan::Image(_))) {
             // Best effort: the error that got us here matters more
             let _ = self.session.cmd(self.sensor, &CAPTURE_STOP);
         }
         result
     }
 
-    fn follow(&mut self, finger_timeout: Duration, on_ready: impl FnOnce()) -> Result<Image> {
+    fn follow(&mut self, finger_timeout: Duration, on_ready: impl FnOnce()) -> Result<Scan> {
         let start = self.event(START_TIMEOUT, "scan start event")?;
         ensure!(
             start[0] == EVENT_START,
@@ -140,7 +149,7 @@ impl<'a> Capture<'a> {
 
     /// The scan result: x, y, w1, w2 and an error code (`<HHHHL`), then x·y
     /// pixels, delivered over one or more `0x51` reads
-    fn image(&mut self) -> Result<Image> {
+    fn image(&mut self) -> Result<Scan> {
         let first = self
             .session
             .cmd_ok(self.sensor, &proto::SCAN_RESULT_REQUEST)?;
@@ -153,7 +162,9 @@ impl<'a> Capture<'a> {
         let field = |at: usize| u16::from_le_bytes([data[at], data[at + 1]]);
         let (height, width, w1, w2) = (field(0) as usize, field(2) as usize, field(4), field(6));
         let error = u32::from_le_bytes(data[8..12].try_into()?);
-        ensure!(error == 0, "the sensor reported scan error {error:#x}");
+        if error != 0 {
+            return Ok(Scan::Rejected(error));
+        }
         let mut pixels = data[12..].to_vec();
         for _ in 0..MAX_RESULT_READS {
             if pixels.len() >= width * height {
@@ -171,13 +182,13 @@ impl<'a> Capture<'a> {
             width * height
         );
         pixels.truncate(width * height);
-        Ok(Image {
+        Ok(Scan::Image(Image {
             width,
             height,
             w1,
             w2,
             pixels,
-        })
+        }))
     }
 }
 

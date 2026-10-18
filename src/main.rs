@@ -165,7 +165,10 @@ fn main() -> Result<()> {
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
                 "--label may only hold lowercase letters, digits and dashes"
             );
-            ensure!((1..=50).contains(&count), "--count must be between 1 and 50");
+            ensure!(
+                (1..=50).contains(&count),
+                "--count must be between 1 and 50"
+            );
             // Registered before the sensor is opened, so a stop request always reaches the scan loop
             let cancelled = Arc::new(AtomicBool::new(false));
             for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
@@ -539,6 +542,9 @@ fn factory_values(
 /// finger's ridges would differ far more.
 const MAX_BLANK_DIFF: f64 = 6.0;
 
+/// Rejected placements (sensor scan errors) tolerated per capture run
+const MAX_REJECTED: usize = 10;
+
 fn run_capture(
     sensor: &usb::Sensor,
     keys: &pairing::HostKeys,
@@ -568,19 +574,33 @@ fn run_capture(
     let mut capture = capture::Capture::new(&mut session, sensor, cancelled);
     let mut captures = Vec::new();
     let mut failure = None;
-    for (i, name) in names.iter().enumerate() {
+    let (mut saved, mut rejected) = (0, 0);
+    while saved < names.len() {
+        let name = &names[saved];
         let stale = capture.drain()?;
         let result = capture.scan(&command, finger_timeout, || {
             println!(
                 "PLACE YOUR FINGER on the sensor now ({}/{})",
-                i + 1,
+                saved + 1,
                 names.len()
             );
             let _ = std::io::stdout().flush();
         });
         let events = std::mem::take(&mut capture.events);
         match result {
-            Ok(image) => {
+            Ok(capture::Scan::Rejected(code)) => {
+                captures.push(json!({ "stale_events": stale, "events": events, "rejected": format!("{code:#x}") }));
+                rejected += 1;
+                if rejected > MAX_REJECTED {
+                    failure = Some(anyhow::anyhow!(
+                        "{rejected} placements rejected after {saved} of {} captures",
+                        names.len()
+                    ));
+                    break;
+                }
+            }
+            Ok(capture::Scan::Image(image)) => {
+                saved += 1;
                 write_private(
                     &out_dir.join(name),
                     &pgm(image.width, image.height, &image.pixels),
@@ -597,7 +617,7 @@ fn run_capture(
                 captures.push(
                     json!({ "stale_events": stale, "events": events, "error": format!("{e:#}") }),
                 );
-                failure = Some(e.context(format!("after {i} of {} captures", names.len())));
+                failure = Some(e.context(format!("after {saved} of {} captures", names.len())));
                 break;
             }
         }
