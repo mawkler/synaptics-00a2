@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     pairing::{hmac, prf, Pairing},
-    usb,
+    proto, usb,
 };
 
 const HANDSHAKE_COMMAND: [u8; 4] = [0x44, 0, 0, 0];
@@ -322,6 +322,18 @@ impl Session {
         let record = self.app_request(request);
         let response = sensor.cmd(&record)?;
         self.parse(&response)
+    }
+
+    /// Like [`Session::cmd`], but fails on a non-zero status and returns the payload
+    pub fn cmd_ok(&mut self, sensor: &usb::Sensor, request: &[u8]) -> Result<Vec<u8>> {
+        let response = self.cmd(sensor, request)?;
+        let (status, payload) = proto::split_status(&response)?;
+        ensure!(
+            status == proto::STATUS_OK,
+            "command {:02x} failed with status {status:04x}",
+            request[0]
+        );
+        Ok(payload.to_vec())
     }
 }
 

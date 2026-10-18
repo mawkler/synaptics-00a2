@@ -3,6 +3,7 @@
 
 mod blobs;
 mod calibrate;
+mod capture;
 mod pairing;
 mod prog;
 mod proto;
@@ -15,6 +16,11 @@ use std::{
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -79,6 +85,29 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Captures one fingerprint image (enroll-mode scan) using a calibration
+    /// saved by `calibrate`, and saves it as a PGM (mode 0600). Writes nothing
+    /// to flash. SIGINT/SIGTERM stop the scan cleanly.
+    Capture {
+        /// File holding the DMI product serial (root-only in sysfs)
+        #[arg(long)]
+        serial_file: PathBuf,
+        /// calibration.bin from an empty-sensor `calibrate` run
+        #[arg(long)]
+        calibration: PathBuf,
+        /// Directory for the image
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// Image file name, without extension: lowercase letters, digits, dashes
+        #[arg(long, default_value = "capture")]
+        label: String,
+        /// Seconds to wait for a finger
+        #[arg(long, default_value_t = 30)]
+        finger_timeout: u64,
+        /// Also write the JSON report here (mode 0600)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 type Decoder = fn(&[u8]) -> Result<Value>;
@@ -120,6 +149,40 @@ fn main() -> Result<()> {
         } => with_sensor(&serial_file, output, |sensor, keys, steps| {
             run_calibrate(sensor, keys, steps, &out_dir)
         }),
+        Command::Capture {
+            serial_file,
+            calibration,
+            out_dir,
+            label,
+            finger_timeout,
+            output,
+        } => {
+            ensure!(
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "--label may only hold lowercase letters, digits and dashes"
+            );
+            // Registered before the sensor is opened, so a stop request always reaches the scan loop
+            let cancelled = Arc::new(AtomicBool::new(false));
+            for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+                signal_hook::flag::register(signal, Arc::clone(&cancelled))?;
+            }
+            let image = out_dir.join(format!("{label}.pgm"));
+            let timeout = Duration::from_secs(finger_timeout);
+            with_sensor(&serial_file, output, |sensor, keys, steps| {
+                run_capture(
+                    sensor,
+                    keys,
+                    steps,
+                    &calibration,
+                    &image,
+                    timeout,
+                    &cancelled,
+                )
+            })
+        }
     }
 }
 
@@ -326,28 +389,7 @@ fn run_calibrate(
     out_dir: &Path,
 ) -> Result<()> {
     let (mut session, _) = open_session(sensor, keys, steps)?;
-    // The capture tables are for this sensor type only
-    let id = proto::SensorId::parse(&tls_ok(&mut session, sensor, &[0x75])?)?;
-    ensure!(
-        (id.major, id.minor) == (0x0190, 0x0061),
-        "the tables are for sensor 0x0190/0x0061 (57K0 FM-3380-003), not {:#06x}/{:#06x}",
-        id.major,
-        id.minor
-    );
-    let bits = proto::parse_factory_bits(&tls_ok(
-        &mut session,
-        sensor,
-        &proto::factory_bits_request(0x0e00),
-    )?)?;
-    let factory = bits
-        .get(&3)
-        .and_then(|value| value.get(4..))
-        .context("no factory calibration values (factory bits subtag 3)")?
-        .to_vec();
-    steps.insert(
-        "factory_bits".into(),
-        json!({ "subtags": bits.keys().collect::<Vec<_>>(), "calibration_values": factory.len() }),
-    );
+    let factory = factory_values(&mut session, sensor, steps)?;
 
     // Read-only look at any clean slate already in partition 6
     let header = read_flash_tls(
@@ -397,7 +439,11 @@ fn run_calibrate(
     let mut blank = Vec::new();
     // python-validity's calibration iterations, then one more scan for the blank frame
     for i in 0..=calibrate::ITERATIONS {
-        tls_ok(&mut session, sensor, &calibration.command()?)?;
+        tls_ok(
+            &mut session,
+            sensor,
+            &calibration.command(calibrate::Mode::Calibrate)?,
+        )?;
         let raw = sensor.read_data()?;
         write_private(&out_dir.join(format!("scan-{i}.raw")), &raw)?;
         scans.push(raw.len());
@@ -410,7 +456,11 @@ fn run_calibrate(
     }
     write_private(&out_dir.join("calibration.bin"), &calibration.data)?;
     write_private(&out_dir.join("blank.bin"), &blank)?;
-    write_private(&out_dir.join("blank.pgm"), &pgm(&blank))?;
+    let rows = blank.len() / tables::BYTES_PER_LINE;
+    write_private(
+        &out_dir.join("blank.pgm"),
+        &pgm(tables::LINE_WIDTH, rows, &pixels(&blank)),
+    )?;
     steps.insert(
         "calibration".into(),
         json!({
@@ -427,16 +477,78 @@ fn run_calibrate(
     Ok(())
 }
 
-/// Sends a command over TLS and returns its payload, failing on a non-zero status
-fn tls_ok(session: &mut tls::Session, sensor: &usb::Sensor, request: &[u8]) -> Result<Vec<u8>> {
-    let response = session.cmd(sensor, request)?;
-    let (status, payload) = proto::split_status(&response)?;
+/// Checks the sensor is the type the capture tables are for, then reads its
+/// factory calibration values (factory bits 0x0e00, subtag 3, minus 4 bytes)
+fn factory_values(
+    session: &mut tls::Session,
+    sensor: &usb::Sensor,
+    steps: &mut Map<String, Value>,
+) -> Result<Vec<u8>> {
+    let id = proto::SensorId::parse(&tls_ok(session, sensor, &[0x75])?)?;
     ensure!(
-        status == proto::STATUS_OK,
-        "command {:02x} failed with status {status:04x}",
-        request[0]
+        (id.major, id.minor) == (0x0190, 0x0061),
+        "the tables are for sensor 0x0190/0x0061 (57K0 FM-3380-003), not {:#06x}/{:#06x}",
+        id.major,
+        id.minor
     );
-    Ok(payload.to_vec())
+    let bits = proto::parse_factory_bits(&tls_ok(
+        session,
+        sensor,
+        &proto::factory_bits_request(0x0e00),
+    )?)?;
+    let factory = bits
+        .get(&3)
+        .and_then(|value| value.get(4..))
+        .context("no factory calibration values (factory bits subtag 3)")?
+        .to_vec();
+    steps.insert(
+        "factory_bits".into(),
+        json!({ "subtags": bits.keys().collect::<Vec<_>>(), "calibration_values": factory.len() }),
+    );
+    Ok(factory)
+}
+
+fn run_capture(
+    sensor: &usb::Sensor,
+    keys: &pairing::HostKeys,
+    steps: &mut Map<String, Value>,
+    calibration: &Path,
+    image_path: &Path,
+    finger_timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    let saved =
+        fs::read(calibration).with_context(|| format!("reading {}", calibration.display()))?;
+    let (mut session, _) = open_session(sensor, keys, steps)?;
+    let factory = factory_values(&mut session, sensor, steps)?;
+    let command =
+        calibrate::Calibration::with_data(factory, saved)?.command(calibrate::Mode::Enroll)?;
+    ensure!(
+        !cancelled.load(Ordering::Relaxed),
+        "cancelled before the scan started"
+    );
+
+    let mut capture = capture::Capture::new(&mut session, sensor, cancelled);
+    let stale = capture.drain()?;
+    let result = capture.scan(&command, finger_timeout, || {
+        println!("PLACE YOUR FINGER on the sensor now");
+        let _ = std::io::stdout().flush();
+    });
+    steps.insert(
+        "scan_events".into(),
+        json!({ "stale": stale, "events": capture.events }),
+    );
+    let image = result?;
+    write_private(image_path, &pgm(image.width, image.height, &image.pixels))?;
+    steps.insert(
+        "image".into(),
+        json!({ "file": image_path, "header": image, "pixels": pixel_stats(&image.pixels) }),
+    );
+    Ok(())
+}
+
+fn tls_ok(session: &mut tls::Session, sensor: &usb::Sensor, request: &[u8]) -> Result<Vec<u8>> {
+    session.cmd_ok(sensor, request)
 }
 
 fn read_flash_tls(
@@ -462,10 +574,9 @@ fn pixels(frame: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-fn pgm(frame: &[u8]) -> Vec<u8> {
-    let rows = frame.len().div_ceil(tables::BYTES_PER_LINE);
-    let mut out = format!("P5\n{} {rows}\n255\n", tables::LINE_WIDTH).into_bytes();
-    out.extend(pixels(frame));
+fn pgm(width: usize, height: usize, pixels: &[u8]) -> Vec<u8> {
+    let mut out = format!("P5\n{width} {height}\n255\n").into_bytes();
+    out.extend(pixels);
     out
 }
 

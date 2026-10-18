@@ -62,6 +62,21 @@ pub fn parse_factory_bits(payload: &[u8]) -> Result<std::collections::BTreeMap<u
     Ok(entries)
 }
 
+/// `get_prg_status2`: fetches the next part of a finished scan's result
+pub const SCAN_RESULT_REQUEST: [u8; 5] = [0x51, 0x00, 0x20, 0x00, 0x00];
+
+/// A `0x51` response payload: a u32 length, then that many bytes
+pub fn scan_result_data(payload: &[u8]) -> Result<&[u8]> {
+    let mut r = Le(payload);
+    let len = r.u32()? as usize;
+    ensure!(
+        r.0.len() == len,
+        "scan result says {len} bytes but carries {}",
+        r.0.len()
+    );
+    Ok(r.0)
+}
+
 /// Little-endian cursor over a payload
 struct Le<'a>(&'a [u8]);
 
@@ -284,6 +299,15 @@ mod tests {
         assert_eq!(bits[&7], [0xaa, 0xbb]);
         assert!(parse_factory_bits(&[p.as_slice(), &[0]].concat()).is_err());
         assert!(parse_factory_bits(&p[..p.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn scan_result_length_must_match() {
+        assert_eq!(
+            scan_result_data(&unhex("02000000 aabb")).unwrap(),
+            [0xaa, 0xbb]
+        );
+        assert!(scan_result_data(&unhex("03000000 aabb")).is_err());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Command transport: requests go out on bulk EP 0x01, responses come back on
-//! bulk EP 0x81. Scan data comes on bulk EP 0x82; EP 0x83/0x84 (interrupts) are unused so far.
+//! bulk EP 0x81. Scan data comes on bulk EP 0x82 and scan events on interrupt
+//! EP 0x83; EP 0x84 is unused.
 
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ const INTERFACE: u8 = 0;
 const EP_CMD_OUT: u8 = 0x01;
 const EP_CMD_IN: u8 = 0x81;
 const EP_DATA_IN: u8 = 0x82;
+const EP_INTERRUPT: u8 = 0x83;
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// python-validity reads responses into a buffer this size
 const MAX_RESPONSE: usize = 100 * 1024;
@@ -85,6 +87,22 @@ impl Sensor {
             .context("reading scan data")?;
         data.truncate(read);
         Ok(data)
+    }
+
+    /// Waits up to `timeout` for a scan event on EP 0x83
+    pub fn read_interrupt(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        let mut event = vec![0; 64];
+        match self
+            .handle
+            .read_interrupt(EP_INTERRUPT, &mut event, timeout)
+        {
+            Ok(read) => {
+                event.truncate(read);
+                Ok(Some(event))
+            }
+            Err(rusb::Error::Timeout) => Ok(None),
+            Err(e) => Err(e).context("reading a scan event"),
+        }
     }
 }
 

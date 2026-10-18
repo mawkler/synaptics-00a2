@@ -9,7 +9,10 @@ pub const LINES_2D: u16 = 0x2f;
 pub const TIMESLOT_TABLE: u16 = 0x34;
 
 pub const ENABLE_RX: u8 = 6;
+const CALL: u8 = 11;
 const REGISTER_WRITE: u8 = 13;
+/// End of Table, Return, End of Data
+const ENDS: [u8; 3] = [1, 2, 4];
 
 pub fn split_chunks(mut program: &[u8]) -> Result<Vec<(u16, Vec<u8>)>> {
     let mut chunks = Vec::new();
@@ -74,14 +77,50 @@ fn find_nth(table: &[u8], n: usize, pred: impl Fn(u8, &[u8]) -> bool) -> Result<
     bail!("the timeslot table has no instruction #{n} of the kind wanted")
 }
 
+fn register(insn: &[u8]) -> u32 {
+    (insn[0] & 0x3f) as u32 * 4 + 0x8000_2000
+}
+
+/// Offsets and opcodes from `start` up to the first End of Table, Return or End of Data
+fn walk(table: &[u8], start: usize) -> Result<Vec<(usize, u8)>> {
+    let (mut pc, mut insns) = (start, Vec::new());
+    while pc < table.len() {
+        let (op, len) = decode(&table[pc..])?;
+        if ENDS.contains(&op) {
+            break;
+        }
+        insns.push((pc, op));
+        pc += len;
+    }
+    Ok(insns)
+}
+
 pub fn find_nth_insn(table: &[u8], opcode: u8, n: usize) -> Result<usize> {
     find_nth(table, n, |op, _| op == opcode)
 }
 
 pub fn find_nth_regwrite(table: &[u8], register: u32, n: usize) -> Result<usize> {
     find_nth(table, n, |op, insn| {
-        op == REGISTER_WRITE && (insn[0] & 0x3f) as u32 * 4 + 0x8000_2000 == register
+        op == REGISTER_WRITE && self::register(insn) == register
     })
+}
+
+/// The DLL's second patch for finger scans: in the routine that the table's
+/// last Call jumps to, the last write to `register` gets `value` as its low byte
+pub fn patch_timeslot_again(table: &[u8], register: u32, value: u8) -> Result<Vec<u8>> {
+    let mut b = table.to_vec();
+    let Some(&(call, _)) = walk(&b, 0)?.iter().rev().find(|(_, op)| *op == CALL) else {
+        return Ok(b);
+    };
+    let routine = (b[call + 1] as usize) << 2;
+    let write = walk(&b, routine)?
+        .into_iter()
+        .rev()
+        .find(|&(pc, op)| op == REGISTER_WRITE && self::register(&b[pc..]) == register);
+    if let Some((pc, _)) = write {
+        b[pc + 1] = value;
+    }
+    Ok(b)
 }
 
 /// The DLL's timeslot patch, which python-validity copies ("If it looks broken
@@ -134,6 +173,25 @@ mod tests {
         assert_eq!(find_nth_regwrite(&table, 0x8000_203c, 1).unwrap(), 3);
         assert!(find_nth_insn(&table, ENABLE_RX, 3).is_err());
         assert!(find_nth_insn(&[0x18], ENABLE_RX, 1).is_err());
+    }
+
+    #[test]
+    fn second_patch_rewrites_the_called_routines_last_register_write() {
+        // 0: Call 12, Call 16, End of Table, NOOPs
+        // 12: write 0x8000203c, Return
+        // 16: write 0x8000203c twice, End of Data
+        let table = [
+            0x10, 0x03, 0x01, 0x10, 0x04, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4f, 0x11,
+            0x00, 0x02, 0x4f, 0x22, 0x00, 0x4f, 0x33, 0x00, 0x04,
+        ];
+        let patched = patch_timeslot_again(&table, 0x8000_203c, 0x99).unwrap();
+        let mut expected = table;
+        expected[20] = 0x99;
+        assert_eq!(patched, expected);
+        assert_eq!(
+            patch_timeslot_again(&[0x00, 0x01], 0x8000_203c, 0x99).unwrap(),
+            [0x00, 0x01]
+        );
     }
 
     #[test]

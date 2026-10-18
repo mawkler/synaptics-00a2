@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! Calibration without a finger, following python-validity's `Sensor`
-//! (`sensor.py`) for sensor type 0x199, which uses "line update type 1".
-//! Unlike python-validity, this never writes the result ("clean slate") to
-//! flash partition 6. It stays in memory and in private files.
+//! Calibration and the `0x02` scan commands that carry it, following
+//! python-validity's `Sensor` (`sensor.py`) for sensor type 0x199, which uses
+//! "line update type 1". Unlike python-validity, this never writes the result
+//! ("clean slate") to flash partition 6. It stays in memory and in private files.
 
 use anyhow::{ensure, Context, Result};
 
@@ -25,6 +25,37 @@ const REGISTER_8000203C: u32 = 0x8000_203c;
 /// the rest, 32 zero bytes, then (u16 length, averaged blank frame, u16 0)
 pub const CLEAN_SLATE_MAGIC: u16 = 0x5002;
 pub const CLEAN_SLATE_HEADER: usize = 0x44;
+
+/// Finger-detect (0x26 enroll, 0x4e identify) and image-reconstruction (0x2e)
+/// chunks python-validity hardcodes for finger scans. The DLL builds them at
+/// runtime, so they are not in it verbatim.
+const ENROLL_DETECT: [u8; 40] = [
+    0xfb, 0xb2, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x30, 0x00, 0x00, 0x00, 0x87, 0x00, 0x02, 0x00,
+    0x67, 0x00, 0x0a, 0x00, 0x01, 0x80, 0x00, 0x00, 0x0a, 0x02, 0x00, 0x00, 0x0b, 0x19, 0x00, 0x00,
+    0x50, 0xc3, 0x60, 0xea, 0x01, 0x09, 0x10, 0x00,
+];
+const IDENTIFY_DETECT: [u8; 40] = [
+    0xfb, 0xb2, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x30, 0x00, 0x00, 0x00, 0x87, 0x00, 0x02, 0x00,
+    0x67, 0x00, 0x0a, 0x00, 0x01, 0x80, 0x00, 0x00, 0x0a, 0x02, 0x00, 0x00, 0x0b, 0x19, 0x00, 0x00,
+    0x88, 0x13, 0xb8, 0x0b, 0x01, 0x09, 0x10, 0x00,
+];
+/// The enroll and identify variants differ only in byte 4 (0x23 vs 0x02)
+fn reconstruction(mode_byte: u8) -> Vec<u8> {
+    let mut chunk = vec![
+        0x02, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x70, 0x00, 0x4d, 0x01, 0x00,
+        0x00, 0xa0, 0x00, 0x8c, 0x00, 0x3c, 0x32, 0x32, 0x1e, 0x3c, 0x0a, 0x02, 0x02,
+    ];
+    chunk[4] = mode_byte;
+    chunk
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Mode {
+    Calibrate,
+    Enroll,
+    #[allow(dead_code)] // for verification scans (M6); tested against python-validity
+    Identify,
+}
 
 pub struct Calibration {
     /// Factory bits 0x0e00, subtag 3, without its first 4 bytes
@@ -84,6 +115,20 @@ impl Calibration {
         })
     }
 
+    /// Restores calibration data saved by an earlier run
+    pub fn with_data(factory: Vec<u8>, data: Vec<u8>) -> Result<Self> {
+        ensure!(
+            data.len() == LINES_PER_CALIBRATION_DATA * BYTES_PER_LINE,
+            "saved calibration has {} bytes, expected {}",
+            data.len(),
+            LINES_PER_CALIBRATION_DATA * BYTES_PER_LINE
+        );
+        Ok(Self {
+            data,
+            ..Self::new(factory)?
+        })
+    }
+
     pub fn frame_size(&self) -> usize {
         self.lines_per_frame * BYTES_PER_LINE
     }
@@ -99,20 +144,36 @@ impl Calibration {
             .collect()
     }
 
-    /// The `0x02` command for one calibration scan, python-validity's
-    /// `build_cmd_02(CaptureMode.CALIBRATE)`
-    pub fn command(&self) -> Result<Vec<u8>> {
+    /// The `0x02` command for one scan, python-validity's `build_cmd_02`
+    pub fn command(&self, mode: Mode) -> Result<Vec<u8>> {
         let mut chunks = prog::split_chunks(&CAPTURE_PROGRAM)?;
         let mut timeslots = None;
         for (kind, value) in &mut chunks {
             if *kind == prog::TIMESLOT_TABLE {
-                let table = prog::patch_timeslot_table(value, true, REPEAT_MULTIPLIER as u8)?;
+                let mut table = prog::patch_timeslot_table(value, true, REPEAT_MULTIPLIER as u8)?;
+                if mode != Mode::Calibrate {
+                    let key = *self
+                        .factory
+                        .get(KEY_CALIBRATION_LINE)
+                        .context("too few factory calibration values")?;
+                    table = prog::patch_timeslot_again(&table, REGISTER_8000203C, key)?;
+                }
                 *value = [self.key_line().as_slice(), &table[LINE_WIDTH..]].concat();
                 timeslots = Some(table);
             }
         }
         let table = timeslots.context("the capture program has no timeslot table")?;
         chunks.push((0x17, Vec::new())); // reply configuration
+        match mode {
+            Mode::Calibrate => {}
+            Mode::Enroll => {
+                chunks.extend([(0x26, ENROLL_DETECT.to_vec()), (0x2e, reconstruction(0x23))])
+            }
+            Mode::Identify => chunks.extend([
+                (0x4e, IDENTIFY_DETECT.to_vec()),
+                (0x2e, reconstruction(0x02)),
+            ]),
+        }
         chunks.push((0x44, 1u32.to_le_bytes().to_vec())); // interleave
 
         let (bits, min, packed) = bitpack(&self.factory);
@@ -170,7 +231,10 @@ impl Calibration {
         }
         chunks.push((0x43, transform)); // line update transform
 
-        let requested_lines = (CALIBRATION_FRAMES * self.lines_per_frame + 1) as u16;
+        let requested_lines = match mode {
+            Mode::Calibrate => (CALIBRATION_FRAMES * self.lines_per_frame + 1) as u16,
+            _ => 0,
+        };
         let mut command = vec![2];
         command.extend((BYTES_PER_LINE as u16).to_le_bytes());
         command.extend(requested_lines.to_le_bytes());
@@ -292,8 +356,12 @@ mod tests {
         let mut calibration = Calibration::new(factory).unwrap();
         assert_eq!(v["lines_per_frame"], calibration.lines_per_frame);
         assert_eq!(
-            calibration.command().unwrap(),
+            calibration.command(Mode::Calibrate).unwrap(),
             unhex(str(&v, "cmd_calibrate_first"))
+        );
+        assert_eq!(
+            calibration.command(Mode::Enroll).unwrap(),
+            unhex(str(&v, "cmd_enroll_first"))
         );
 
         let len = 3 * calibration.frame_size() + BYTES_PER_LINE;
@@ -316,10 +384,24 @@ mod tests {
                 "iteration {it}"
             );
         }
+        for (mode, key) in [
+            (Mode::Calibrate, "cmd_calibrate_calibrated_sha256"),
+            (Mode::Enroll, "cmd_enroll_calibrated_sha256"),
+            (Mode::Identify, "cmd_identify_calibrated_sha256"),
+        ] {
+            assert_eq!(
+                sha256(&calibration.command(mode).unwrap()),
+                str(&v, key),
+                "{key}"
+            );
+        }
+        let restored =
+            Calibration::with_data(calibration.factory.clone(), calibration.data.clone()).unwrap();
         assert_eq!(
-            sha256(&calibration.command().unwrap()),
-            str(&v, "cmd_calibrate_calibrated_sha256")
+            restored.command(Mode::Enroll).unwrap(),
+            calibration.command(Mode::Enroll).unwrap()
         );
+        assert!(Calibration::with_data(calibration.factory.clone(), vec![0; 10]).is_err());
         assert!(calibration.average(&[0; 100]).is_err());
     }
 
