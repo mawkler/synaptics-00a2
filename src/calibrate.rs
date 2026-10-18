@@ -115,20 +115,6 @@ impl Calibration {
         })
     }
 
-    /// Restores calibration data saved by an earlier run
-    pub fn with_data(factory: Vec<u8>, data: Vec<u8>) -> Result<Self> {
-        ensure!(
-            data.len() == LINES_PER_CALIBRATION_DATA * BYTES_PER_LINE,
-            "saved calibration has {} bytes, expected {}",
-            data.len(),
-            LINES_PER_CALIBRATION_DATA * BYTES_PER_LINE
-        );
-        Ok(Self {
-            data,
-            ..Self::new(factory)?
-        })
-    }
-
     pub fn frame_size(&self) -> usize {
         self.lines_per_frame * BYTES_PER_LINE
     }
@@ -395,13 +381,6 @@ mod tests {
                 "{key}"
             );
         }
-        let restored =
-            Calibration::with_data(calibration.factory.clone(), calibration.data.clone()).unwrap();
-        assert_eq!(
-            restored.command(Mode::Enroll).unwrap(),
-            calibration.command(Mode::Enroll).unwrap()
-        );
-        assert!(Calibration::with_data(calibration.factory.clone(), vec![0; 10]).is_err());
         assert!(calibration.average(&[0; 100]).is_err());
     }
 

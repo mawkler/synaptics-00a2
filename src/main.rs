@@ -85,16 +85,13 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Captures one fingerprint image (enroll-mode scan) using a calibration
-    /// saved by `calibrate`, and saves it as a PGM (mode 0600). Writes nothing
-    /// to flash. SIGINT/SIGTERM stop the scan cleanly.
+    /// Calibrates in memory with no finger on the sensor, then captures one
+    /// fingerprint image (enroll-mode scan) and saves it as a PGM (mode 0600).
+    /// Writes nothing to flash. SIGINT/SIGTERM stop the scan cleanly.
     Capture {
         /// File holding the DMI product serial (root-only in sysfs)
         #[arg(long)]
         serial_file: PathBuf,
-        /// calibration.bin from an empty-sensor `calibrate` run
-        #[arg(long)]
-        calibration: PathBuf,
         /// Directory for the image
         #[arg(long)]
         out_dir: PathBuf,
@@ -151,7 +148,6 @@ fn main() -> Result<()> {
         }),
         Command::Capture {
             serial_file,
-            calibration,
             out_dir,
             label,
             finger_timeout,
@@ -172,15 +168,7 @@ fn main() -> Result<()> {
             let image = out_dir.join(format!("{label}.pgm"));
             let timeout = Duration::from_secs(finger_timeout);
             with_sensor(&serial_file, output, |sensor, keys, steps| {
-                run_capture(
-                    sensor,
-                    keys,
-                    steps,
-                    &calibration,
-                    &image,
-                    timeout,
-                    &cancelled,
-                )
+                run_capture(sensor, keys, steps, &image, timeout, &cancelled)
             })
         }
     }
@@ -390,16 +378,48 @@ fn run_calibrate(
 ) -> Result<()> {
     let (mut session, _) = open_session(sensor, keys, steps)?;
     let factory = factory_values(&mut session, sensor, steps)?;
-
-    // Read-only look at any clean slate already in partition 6
-    let header = read_flash_tls(
-        &mut session,
-        sensor,
-        6,
-        0,
-        calibrate::CLEAN_SLATE_HEADER as u32,
+    let calibrated = calibrate_in_memory(&mut session, sensor, factory, steps)?;
+    if let Some(record) = &calibrated.flash_record {
+        write_private(&out_dir.join("partition6-clean-slate.bin"), record)?;
+    }
+    for (i, raw) in calibrated.raw_scans.iter().enumerate() {
+        write_private(&out_dir.join(format!("scan-{i}.raw")), raw)?;
+    }
+    write_private(
+        &out_dir.join("calibration.bin"),
+        &calibrated.calibration.data,
     )?;
-    let flash_frame = match calibrate::clean_slate_header(&header) {
+    write_private(&out_dir.join("blank.bin"), &calibrated.blank)?;
+    let rows = calibrated.blank.len() / tables::BYTES_PER_LINE;
+    write_private(
+        &out_dir.join("blank.pgm"),
+        &pgm(tables::LINE_WIDTH, rows, &pixels(&calibrated.blank)),
+    )?;
+    Ok(())
+}
+
+struct Calibrated {
+    calibration: calibrate::Calibration,
+    blank: Vec<u8>,
+    raw_scans: Vec<Vec<u8>>,
+    /// The clean slate record in partition 6, if there is a valid one
+    flash_record: Option<Vec<u8>>,
+    /// Mean absolute pixel difference between our blank scan and that record's frame
+    blank_vs_flash: Option<f64>,
+}
+
+/// Reads any clean slate in partition 6 (read-only), then runs
+/// python-validity's calibration scans plus one blank scan, keeping the
+/// result in memory. Scans only completed after calibration scans in the same
+/// power cycle (M4b), so every capture calibrates first.
+fn calibrate_in_memory(
+    session: &mut tls::Session,
+    sensor: &usb::Sensor,
+    factory: Vec<u8>,
+    steps: &mut Map<String, Value>,
+) -> Result<Calibrated> {
+    let header = read_flash_tls(session, sensor, 6, 0, calibrate::CLEAN_SLATE_HEADER as u32)?;
+    let flash_record = match calibrate::clean_slate_header(&header) {
         None => {
             steps.insert(
                 "partition6".into(),
@@ -412,7 +432,7 @@ fn run_calibrate(
             while record.len() < len {
                 let address = (calibrate::CLEAN_SLATE_HEADER + record.len()) as u32;
                 let chunk = read_flash_tls(
-                    &mut session,
+                    session,
                     sensor,
                     6,
                     address,
@@ -422,59 +442,56 @@ fn run_calibrate(
                 record.extend(chunk);
             }
             record.truncate(len);
-            write_private(&out_dir.join("partition6-clean-slate.bin"), &record)?;
             let hash_ok = Sha256::digest(&record).as_slice() == hash;
             steps.insert(
                 "partition6".into(),
                 json!({ "clean_slate": true, "bytes": len, "hash_ok": hash_ok }),
             );
-            // (u16 length, averaged blank frame, u16 0)
-            let frame_len = u16::from_le_bytes([record[0], record[1]]) as usize;
-            record.get(2..2 + frame_len).map(<[u8]>::to_vec)
+            hash_ok.then_some(record)
         }
     };
 
     let mut calibration = calibrate::Calibration::new(factory)?;
-    let mut scans = Vec::new();
+    let mut raw_scans = Vec::new();
     let mut blank = Vec::new();
     // python-validity's calibration iterations, then one more scan for the blank frame
     for i in 0..=calibrate::ITERATIONS {
         tls_ok(
-            &mut session,
+            session,
             sensor,
             &calibration.command(calibrate::Mode::Calibrate)?,
         )?;
         let raw = sensor.read_data()?;
-        write_private(&out_dir.join(format!("scan-{i}.raw")), &raw)?;
-        scans.push(raw.len());
         let averaged = calibration.average(&raw)?;
+        raw_scans.push(raw);
         if i < calibrate::ITERATIONS {
             calibration.accumulate(&averaged);
         } else {
             blank = averaged;
         }
     }
-    write_private(&out_dir.join("calibration.bin"), &calibration.data)?;
-    write_private(&out_dir.join("blank.bin"), &blank)?;
-    let rows = blank.len() / tables::BYTES_PER_LINE;
-    write_private(
-        &out_dir.join("blank.pgm"),
-        &pgm(tables::LINE_WIDTH, rows, &pixels(&blank)),
-    )?;
+    // The record is (u16 length, averaged blank frame, u16 0)
+    let blank_vs_flash = flash_record.as_ref().and_then(|record| {
+        let len = u16::from_le_bytes([record[0], record[1]]) as usize;
+        let frame = record.get(2..2 + len)?;
+        Some(mean_abs_diff(&pixels(&blank), &pixels(frame)))
+    });
     steps.insert(
         "calibration".into(),
         json!({
-            "scan_bytes": scans,
+            "scan_bytes": raw_scans.iter().map(Vec::len).collect::<Vec<_>>(),
             "expected_scan_bytes": calibration.frame_size() * 3 + tables::BYTES_PER_LINE,
             "blank_pixels": pixel_stats(&pixels(&blank)),
-            "blank_vs_partition6_mean_abs_diff": flash_frame.map(|frame| {
-                let (ours, theirs) = (pixels(&blank), pixels(&frame));
-                let total: u64 = ours.iter().zip(&theirs).map(|(&a, &b)| a.abs_diff(b) as u64).sum();
-                total as f64 / ours.len().min(theirs.len()).max(1) as f64
-            }),
+            "blank_vs_partition6_mean_abs_diff": blank_vs_flash,
         }),
     );
-    Ok(())
+    Ok(Calibrated {
+        calibration,
+        blank,
+        raw_scans,
+        flash_record,
+        blank_vs_flash,
+    })
 }
 
 /// Checks the sensor is the type the capture tables are for, then reads its
@@ -508,21 +525,31 @@ fn factory_values(
     Ok(factory)
 }
 
+/// Largest mean absolute difference between the blank scan and the stored
+/// clean slate that still counts as an empty sensor. M4a measured 2.29; a
+/// finger's ridges would differ far more.
+const MAX_BLANK_DIFF: f64 = 6.0;
+
 fn run_capture(
     sensor: &usb::Sensor,
     keys: &pairing::HostKeys,
     steps: &mut Map<String, Value>,
-    calibration: &Path,
     image_path: &Path,
     finger_timeout: Duration,
     cancelled: &AtomicBool,
 ) -> Result<()> {
-    let saved =
-        fs::read(calibration).with_context(|| format!("reading {}", calibration.display()))?;
     let (mut session, _) = open_session(sensor, keys, steps)?;
     let factory = factory_values(&mut session, sensor, steps)?;
-    let command =
-        calibrate::Calibration::with_data(factory, saved)?.command(calibrate::Mode::Enroll)?;
+    let calibrated = calibrate_in_memory(&mut session, sensor, factory, steps)?;
+    let diff = calibrated
+        .blank_vs_flash
+        .context("partition 6 has no valid clean slate to check the blank scan against")?;
+    ensure!(
+        diff <= MAX_BLANK_DIFF,
+        "the blank scan differs from the stored clean slate by {diff:.1} grey levels (limit {MAX_BLANK_DIFF}): \
+         was a finger on the sensor during calibration? Lift it and run again"
+    );
+    let command = calibrated.calibration.command(calibrate::Mode::Enroll)?;
     ensure!(
         !cancelled.load(Ordering::Relaxed),
         "cancelled before the scan started"
@@ -545,6 +572,11 @@ fn run_capture(
         json!({ "file": image_path, "header": image, "pixels": pixel_stats(&image.pixels) }),
     );
     Ok(())
+}
+
+fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+    let total: u64 = a.iter().zip(b).map(|(&x, &y)| x.abs_diff(y) as u64).sum();
+    total as f64 / a.len().min(b.len()).max(1) as f64
 }
 
 fn tls_ok(session: &mut tls::Session, sensor: &usb::Sensor, request: &[u8]) -> Result<Vec<u8>> {
