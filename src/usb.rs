@@ -28,14 +28,26 @@ pub struct Sensor {
 }
 
 impl Sensor {
-    /// Opens and claims the reader. Never resets it or re-sends SET_CONFIGURATION,
-    /// since either changes device state (python-validity does both).
+    /// Opens and claims the first 06cb:00a2 reader
     pub fn open() -> Result<Self> {
+        Self::open_where(|_| true)
+    }
+
+    /// Opens and claims the reader at this bus and address, e.g. the device
+    /// libfprint has handed to the TOD driver
+    pub fn open_at(bus: u8, address: u8) -> Result<Self> {
+        Self::open_where(|d| d.bus_number() == bus && d.address() == address)
+    }
+
+    /// Never resets the reader or re-sends SET_CONFIGURATION, since either
+    /// changes device state (python-validity does both)
+    fn open_where(wanted: impl Fn(&rusb::Device<GlobalContext>) -> bool) -> Result<Self> {
         let device = rusb::devices()?
             .iter()
             .find(|d| {
-                d.device_descriptor()
-                    .is_ok_and(|desc| desc.vendor_id() == VID && desc.product_id() == PID)
+                wanted(d)
+                    && d.device_descriptor()
+                        .is_ok_and(|desc| desc.vendor_id() == VID && desc.product_id() == PID)
             })
             .context("no 06cb:00a2 device found")?;
         let path = format!(

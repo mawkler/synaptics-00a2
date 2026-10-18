@@ -6,6 +6,10 @@ description = "Userspace driver for the Synaptics 06cb:00a2 fingerprint reader"
 license = "LGPL-2.1-or-later"
 publish = false
 
+[lib]
+# No doc examples; skipping rustdoc also sidesteps an unrunnable rustdoc shim here
+doctest = false
+
 [dependencies]
 aes = "0.8"
 anyhow = "1"
@@ -20,3 +24,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 signal-hook = "0.3"
+
+[workspace]
+members = [".", "tod"]

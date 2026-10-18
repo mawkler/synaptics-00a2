@@ -1,0 +1,23 @@
+[package]
+name = "syna-00a2-tod"
+version = "0.1.0"
+edition = "2021"
+description = "libfprint-TOD driver module for the Synaptics 06cb:00a2 fingerprint reader"
+license = "LGPL-2.1-or-later"
+publish = false
+
+[lib]
+name = "syna_00a2_tod"
+crate-type = ["cdylib"]
+# A test binary can't link libfprint-2-tod without libfprint itself; the
+# module is tested by loading it into libfprint (tools/tod_test.py)
+test = false
+doctest = false
+
+[dependencies]
+anyhow = "1"
+syna-00a2 = { path = ".." }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
