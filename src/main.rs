@@ -85,20 +85,24 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Calibrates in memory with no finger on the sensor, then captures one
-    /// fingerprint image (enroll-mode scan) and saves it as a PGM (mode 0600).
-    /// Writes nothing to flash. SIGINT/SIGTERM stop the scan cleanly.
+    /// Calibrates in memory with no finger on the sensor, then captures
+    /// fingerprint images (enroll-mode scans) and saves them as PGMs (mode
+    /// 0600). Writes nothing to flash. SIGINT/SIGTERM stop the scan cleanly.
     Capture {
         /// File holding the DMI product serial (root-only in sysfs)
         #[arg(long)]
         serial_file: PathBuf,
-        /// Directory for the image
+        /// Directory for the images
         #[arg(long)]
         out_dir: PathBuf,
-        /// Image file name, without extension: lowercase letters, digits, dashes
+        /// Image file name, without extension: lowercase letters, digits, dashes.
+        /// With --count above 1, each image gets a -01, -02, ... suffix.
         #[arg(long, default_value = "capture")]
         label: String,
-        /// Seconds to wait for a finger
+        /// Placements to capture after one calibration; lift the finger between them
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+        /// Seconds to wait for each touch
         #[arg(long, default_value_t = 30)]
         finger_timeout: u64,
         /// Also write the JSON report here (mode 0600)
@@ -150,6 +154,7 @@ fn main() -> Result<()> {
             serial_file,
             out_dir,
             label,
+            count,
             finger_timeout,
             output,
         } => {
@@ -160,15 +165,19 @@ fn main() -> Result<()> {
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
                 "--label may only hold lowercase letters, digits and dashes"
             );
+            ensure!((1..=50).contains(&count), "--count must be between 1 and 50");
             // Registered before the sensor is opened, so a stop request always reaches the scan loop
             let cancelled = Arc::new(AtomicBool::new(false));
             for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
                 signal_hook::flag::register(signal, Arc::clone(&cancelled))?;
             }
-            let image = out_dir.join(format!("{label}.pgm"));
+            let names: Vec<String> = match count {
+                1 => vec![format!("{label}.pgm")],
+                _ => (1..=count).map(|i| format!("{label}-{i:02}.pgm")).collect(),
+            };
             let timeout = Duration::from_secs(finger_timeout);
             with_sensor(&serial_file, output, |sensor, keys, steps| {
-                run_capture(sensor, keys, steps, &image, timeout, &cancelled)
+                run_capture(sensor, keys, steps, &out_dir, &names, timeout, &cancelled)
             })
         }
     }
@@ -534,7 +543,8 @@ fn run_capture(
     sensor: &usb::Sensor,
     keys: &pairing::HostKeys,
     steps: &mut Map<String, Value>,
-    image_path: &Path,
+    out_dir: &Path,
+    names: &[String],
     finger_timeout: Duration,
     cancelled: &AtomicBool,
 ) -> Result<()> {
@@ -556,22 +566,44 @@ fn run_capture(
     );
 
     let mut capture = capture::Capture::new(&mut session, sensor, cancelled);
-    let stale = capture.drain()?;
-    let result = capture.scan(&command, finger_timeout, || {
-        println!("PLACE YOUR FINGER on the sensor now");
-        let _ = std::io::stdout().flush();
-    });
-    steps.insert(
-        "scan_events".into(),
-        json!({ "stale": stale, "events": capture.events }),
-    );
-    let image = result?;
-    write_private(image_path, &pgm(image.width, image.height, &image.pixels))?;
-    steps.insert(
-        "image".into(),
-        json!({ "file": image_path, "header": image, "pixels": pixel_stats(&image.pixels) }),
-    );
-    Ok(())
+    let mut captures = Vec::new();
+    let mut failure = None;
+    for (i, name) in names.iter().enumerate() {
+        let stale = capture.drain()?;
+        let result = capture.scan(&command, finger_timeout, || {
+            println!(
+                "PLACE YOUR FINGER on the sensor now ({}/{})",
+                i + 1,
+                names.len()
+            );
+            let _ = std::io::stdout().flush();
+        });
+        let events = std::mem::take(&mut capture.events);
+        match result {
+            Ok(image) => {
+                write_private(
+                    &out_dir.join(name),
+                    &pgm(image.width, image.height, &image.pixels),
+                )?;
+                captures.push(json!({
+                    "file": name,
+                    "header": image,
+                    "pixels": pixel_stats(&image.pixels),
+                    "stale_events": stale,
+                    "events": events,
+                }));
+            }
+            Err(e) => {
+                captures.push(
+                    json!({ "stale_events": stale, "events": events, "error": format!("{e:#}") }),
+                );
+                failure = Some(e.context(format!("after {i} of {} captures", names.len())));
+                break;
+            }
+        }
+    }
+    steps.insert("captures".into(), json!(captures));
+    failure.map_or(Ok(()), Err)
 }
 
 fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {

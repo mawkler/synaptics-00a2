@@ -22,7 +22,9 @@ const CAPTURE_STOP: [u8; 1] = [0x04];
 
 const POLL: Duration = Duration::from_millis(100);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
-const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Generous because the final progress event may only come once the finger is
+/// lifted (M4b: it came 2.6 s after the touch, and never while a finger stayed)
+const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 /// python-validity caps the follow-up `0x51` reads the same way
 const MAX_RESULT_READS: usize = 8;
 
