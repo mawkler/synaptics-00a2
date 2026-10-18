@@ -2,8 +2,11 @@
 //! Userspace driver for the Synaptics 06cb:00a2 fingerprint reader
 
 mod blobs;
+mod calibrate;
 mod pairing;
+mod prog;
 mod proto;
+mod tables;
 mod tls;
 mod usb;
 
@@ -61,6 +64,21 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Calibrates with no finger on the sensor: reads the factory calibration
+    /// bits and any clean slate in flash partition 6, runs python-validity's
+    /// calibration scans plus a blank scan, and saves them (mode 0600). Unlike
+    /// python-validity, writes nothing to flash.
+    Calibrate {
+        /// File holding the DMI product serial (root-only in sysfs)
+        #[arg(long)]
+        serial_file: PathBuf,
+        /// Directory for the raw scans, calibration data and blank frame
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// Also write the JSON report here (mode 0600)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 type Decoder = fn(&[u8]) -> Result<Value>;
@@ -94,7 +112,14 @@ fn main() -> Result<()> {
         Command::Handshake {
             serial_file,
             output,
-        } => handshake(&serial_file, output),
+        } => with_sensor(&serial_file, output, run_handshake),
+        Command::Calibrate {
+            serial_file,
+            out_dir,
+            output,
+        } => with_sensor(&serial_file, output, |sensor, keys, steps| {
+            run_calibrate(sensor, keys, steps, &out_dir)
+        }),
     }
 }
 
@@ -221,11 +246,17 @@ fn pairing(
     )
 }
 
-fn handshake(serial_file: &Path, output: Option<PathBuf>) -> Result<()> {
+/// Opens the sensor, runs `run` with a map of named steps for the report, and
+/// releases the sensor whatever happens
+fn with_sensor(
+    serial_file: &Path,
+    output: Option<PathBuf>,
+    run: impl FnOnce(&usb::Sensor, &pairing::HostKeys, &mut Map<String, Value>) -> Result<()>,
+) -> Result<()> {
     let (_, keys) = dmi_keys(serial_file)?;
     let sensor = usb::Sensor::open()?;
     let mut steps = Map::new();
-    let result = run_handshake(&sensor, &keys, &mut steps);
+    let result = run(&sensor, &keys, &mut steps);
     let device = sensor.path.clone();
     // No reboot or reset: the sensor keeps its TLS session, as with MR 626
     drop(sensor);
@@ -236,11 +267,13 @@ fn handshake(serial_file: &Path, output: Option<PathBuf>) -> Result<()> {
     result
 }
 
-fn run_handshake(
+/// The plain open sequence, then a TLS session with the stored pairing.
+/// Returns the session and the plain ROM info response.
+fn open_session(
     sensor: &usb::Sensor,
     keys: &pairing::HostKeys,
     steps: &mut Map<String, Value>,
-) -> Result<()> {
+) -> Result<(tls::Session, Vec<u8>)> {
     // The plain open sequence python-validity, MR 626 and synafp all send
     let mut plain = |name: &str, request: &[u8]| -> Result<Vec<u8>> {
         let response = sensor.cmd(request)?;
@@ -267,14 +300,189 @@ fn run_handshake(
         "the sensor's ECDH key is not signed by the firmware key"
     );
 
-    let mut session = tls::connect(sensor, &pairing)?;
+    let session = tls::connect(sensor, &pairing)?;
     steps.insert("handshake".into(), "ok".into());
+    Ok((session, rom_info))
+}
+
+fn run_handshake(
+    sensor: &usb::Sensor,
+    keys: &pairing::HostKeys,
+    steps: &mut Map<String, Value>,
+) -> Result<()> {
+    let (mut session, rom_info) = open_session(sensor, keys, steps)?;
     let tls_rom_info = session.cmd(sensor, &[0x01])?;
     steps.insert(
         "tls_rom_info".into(),
         json!({ "response": hex(&tls_rom_info), "matches_plain": tls_rom_info == rom_info }),
     );
     Ok(())
+}
+
+fn run_calibrate(
+    sensor: &usb::Sensor,
+    keys: &pairing::HostKeys,
+    steps: &mut Map<String, Value>,
+    out_dir: &Path,
+) -> Result<()> {
+    let (mut session, _) = open_session(sensor, keys, steps)?;
+    // The capture tables are for this sensor type only
+    let id = proto::SensorId::parse(&tls_ok(&mut session, sensor, &[0x75])?)?;
+    ensure!(
+        (id.major, id.minor) == (0x0190, 0x0061),
+        "the tables are for sensor 0x0190/0x0061 (57K0 FM-3380-003), not {:#06x}/{:#06x}",
+        id.major,
+        id.minor
+    );
+    let bits = proto::parse_factory_bits(&tls_ok(
+        &mut session,
+        sensor,
+        &proto::factory_bits_request(0x0e00),
+    )?)?;
+    let factory = bits
+        .get(&3)
+        .and_then(|value| value.get(4..))
+        .context("no factory calibration values (factory bits subtag 3)")?
+        .to_vec();
+    steps.insert(
+        "factory_bits".into(),
+        json!({ "subtags": bits.keys().collect::<Vec<_>>(), "calibration_values": factory.len() }),
+    );
+
+    // Read-only look at any clean slate already in partition 6
+    let header = read_flash_tls(
+        &mut session,
+        sensor,
+        6,
+        0,
+        calibrate::CLEAN_SLATE_HEADER as u32,
+    )?;
+    let flash_frame = match calibrate::clean_slate_header(&header) {
+        None => {
+            steps.insert(
+                "partition6".into(),
+                json!({ "clean_slate": false, "header": hex(&header[..8.min(header.len())]) }),
+            );
+            None
+        }
+        Some((len, hash)) => {
+            let mut record = Vec::new();
+            while record.len() < len {
+                let address = (calibrate::CLEAN_SLATE_HEADER + record.len()) as u32;
+                let chunk = read_flash_tls(
+                    &mut session,
+                    sensor,
+                    6,
+                    address,
+                    (len - record.len()).min(0x1000) as u32,
+                )?;
+                ensure!(!chunk.is_empty(), "partition 6 read returned nothing");
+                record.extend(chunk);
+            }
+            record.truncate(len);
+            write_private(&out_dir.join("partition6-clean-slate.bin"), &record)?;
+            let hash_ok = Sha256::digest(&record).as_slice() == hash;
+            steps.insert(
+                "partition6".into(),
+                json!({ "clean_slate": true, "bytes": len, "hash_ok": hash_ok }),
+            );
+            // (u16 length, averaged blank frame, u16 0)
+            let frame_len = u16::from_le_bytes([record[0], record[1]]) as usize;
+            record.get(2..2 + frame_len).map(<[u8]>::to_vec)
+        }
+    };
+
+    let mut calibration = calibrate::Calibration::new(factory)?;
+    let mut scans = Vec::new();
+    let mut blank = Vec::new();
+    // python-validity's calibration iterations, then one more scan for the blank frame
+    for i in 0..=calibrate::ITERATIONS {
+        tls_ok(&mut session, sensor, &calibration.command()?)?;
+        let raw = sensor.read_data()?;
+        write_private(&out_dir.join(format!("scan-{i}.raw")), &raw)?;
+        scans.push(raw.len());
+        let averaged = calibration.average(&raw)?;
+        if i < calibrate::ITERATIONS {
+            calibration.accumulate(&averaged);
+        } else {
+            blank = averaged;
+        }
+    }
+    write_private(&out_dir.join("calibration.bin"), &calibration.data)?;
+    write_private(&out_dir.join("blank.bin"), &blank)?;
+    write_private(&out_dir.join("blank.pgm"), &pgm(&blank))?;
+    steps.insert(
+        "calibration".into(),
+        json!({
+            "scan_bytes": scans,
+            "expected_scan_bytes": calibration.frame_size() * 3 + tables::BYTES_PER_LINE,
+            "blank_pixels": pixel_stats(&pixels(&blank)),
+            "blank_vs_partition6_mean_abs_diff": flash_frame.map(|frame| {
+                let (ours, theirs) = (pixels(&blank), pixels(&frame));
+                let total: u64 = ours.iter().zip(&theirs).map(|(&a, &b)| a.abs_diff(b) as u64).sum();
+                total as f64 / ours.len().min(theirs.len()).max(1) as f64
+            }),
+        }),
+    );
+    Ok(())
+}
+
+/// Sends a command over TLS and returns its payload, failing on a non-zero status
+fn tls_ok(session: &mut tls::Session, sensor: &usb::Sensor, request: &[u8]) -> Result<Vec<u8>> {
+    let response = session.cmd(sensor, request)?;
+    let (status, payload) = proto::split_status(&response)?;
+    ensure!(
+        status == proto::STATUS_OK,
+        "command {:02x} failed with status {status:04x}",
+        request[0]
+    );
+    Ok(payload.to_vec())
+}
+
+fn read_flash_tls(
+    session: &mut tls::Session,
+    sensor: &usb::Sensor,
+    partition: u8,
+    address: u32,
+    size: u32,
+) -> Result<Vec<u8>> {
+    let payload = tls_ok(
+        session,
+        sensor,
+        &proto::read_flash_request(partition, address, size),
+    )?;
+    Ok(proto::read_flash_data(&payload)?.to_vec())
+}
+
+/// A frame's pixels: each line without its 8-byte header
+fn pixels(frame: &[u8]) -> Vec<u8> {
+    frame
+        .chunks(tables::BYTES_PER_LINE)
+        .flat_map(|line| line.get(8..).unwrap_or_default().to_vec())
+        .collect()
+}
+
+fn pgm(frame: &[u8]) -> Vec<u8> {
+    let rows = frame.len().div_ceil(tables::BYTES_PER_LINE);
+    let mut out = format!("P5\n{} {rows}\n255\n", tables::LINE_WIDTH).into_bytes();
+    out.extend(pixels(frame));
+    out
+}
+
+fn pixel_stats(pixels: &[u8]) -> Value {
+    let n = pixels.len().max(1) as f64;
+    let mean = pixels.iter().map(|&p| p as f64).sum::<f64>() / n;
+    let variance = pixels
+        .iter()
+        .map(|&p| (p as f64 - mean).powi(2))
+        .sum::<f64>()
+        / n;
+    json!({
+        "min": pixels.iter().min(),
+        "max": pixels.iter().max(),
+        "mean": (mean * 100.0).round() / 100.0,
+        "stddev": (variance.sqrt() * 100.0).round() / 100.0,
+    })
 }
 
 fn report(value: &Value, output: Option<PathBuf>) -> Result<()> {

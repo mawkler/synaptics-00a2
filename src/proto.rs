@@ -34,6 +34,34 @@ pub fn read_flash_data(payload: &[u8]) -> Result<&[u8]> {
     r.take(size)
 }
 
+/// `0x6f` request, `<BHHL`: tag, then zeros
+pub fn factory_bits_request(tag: u16) -> Vec<u8> {
+    let mut request = vec![0x6f];
+    request.extend(tag.to_le_bytes());
+    request.extend([0; 6]);
+    request
+}
+
+/// `0x6f` response: a u32 of unknown meaning, a u32 entry count, then entries
+/// of `<LHHHH` (pointer, length, tag, subtag, flags) and a value. Keyed by subtag.
+pub fn parse_factory_bits(payload: &[u8]) -> Result<std::collections::BTreeMap<u16, Vec<u8>>> {
+    let mut r = Le(payload);
+    r.u32()?;
+    let count = r.u32()?;
+    let mut entries = std::collections::BTreeMap::new();
+    for _ in 0..count {
+        let (_pointer, len, _tag, subtag, _flags) =
+            (r.u32()?, r.u16()?, r.u16()?, r.u16()?, r.u16()?);
+        entries.insert(subtag, r.take(len as usize)?.to_vec());
+    }
+    ensure!(
+        r.0.is_empty(),
+        "{} bytes of garbage after the factory bits",
+        r.0.len()
+    );
+    Ok(entries)
+}
+
 /// Little-endian cursor over a payload
 struct Le<'a>(&'a [u8]);
 
@@ -241,6 +269,21 @@ mod tests {
             [0xaa, 0xbb, 0xcc]
         );
         assert!(read_flash_data(&unhex("04000000 0000 aabbcc")).is_err());
+    }
+
+    #[test]
+    fn factory_bits_are_keyed_by_subtag() {
+        assert_eq!(factory_bits_request(0x0e00), unhex("6f000e000000000000"));
+        let p = unhex(
+            "880d0000 02000000
+             08000000 0600 000e 0300 0080 07000000 7e7f
+             14000000 0200 000e 0700 0080 aabb",
+        );
+        let bits = parse_factory_bits(&p).unwrap();
+        assert_eq!(bits[&3], unhex("070000007e7f"));
+        assert_eq!(bits[&7], [0xaa, 0xbb]);
+        assert!(parse_factory_bits(&[p.as_slice(), &[0]].concat()).is_err());
+        assert!(parse_factory_bits(&p[..p.len() - 1]).is_err());
     }
 
     #[test]
