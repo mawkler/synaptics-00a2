@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Userspace driver for the Synaptics 06cb:00a2 fingerprint reader
 
+mod blobs;
 mod pairing;
 mod proto;
+mod tls;
 mod usb;
 
 use std::{
@@ -12,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -48,6 +50,17 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Opens a TLS session with the stored pairing: python-validity's plain open
+    /// sequence (including the init blob), the handshake, then one encrypted
+    /// ROM-info read. Writes no flash and prints no key material.
+    Handshake {
+        /// File holding the DMI product serial (root-only in sysfs)
+        #[arg(long)]
+        serial_file: PathBuf,
+        /// Also write the JSON report here (mode 0600)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 type Decoder = fn(&[u8]) -> Result<Value>;
@@ -78,7 +91,23 @@ fn main() -> Result<()> {
             from_dump,
             output,
         } => pairing(&serial_file, dump, from_dump, output),
+        Command::Handshake {
+            serial_file,
+            output,
+        } => handshake(&serial_file, output),
     }
+}
+
+/// This host's DMI product name and its pairing keys. The serial is root-only
+/// in sysfs, so it comes from a private copy.
+fn dmi_keys(serial_file: &Path) -> Result<(String, pairing::HostKeys)> {
+    let product_name = fs::read_to_string("/sys/class/dmi/id/product_name")?
+        .trim()
+        .to_owned();
+    let serial = fs::read_to_string(serial_file)
+        .with_context(|| format!("reading {}", serial_file.display()))?;
+    let keys = pairing::HostKeys::derive(&product_name, serial.trim());
+    Ok((product_name, keys))
 }
 
 fn info(output: Option<PathBuf>) -> Result<()> {
@@ -116,16 +145,9 @@ fn pairing(
     output: Option<PathBuf>,
 ) -> Result<()> {
     // Read the host identity first, so a missing file fails before the sensor is touched
-    let product_name = fs::read_to_string("/sys/class/dmi/id/product_name")?
-        .trim()
-        .to_owned();
-    let serial = fs::read_to_string(serial_file)
-        .with_context(|| format!("reading {}", serial_file.display()))?;
+    let (product_name, dmi) = dmi_keys(serial_file)?;
     let identities = [
-        (
-            "dmi",
-            pairing::HostKeys::derive(&product_name, serial.trim()),
-        ),
+        ("dmi", dmi),
         // python-validity silently uses this identity when it can't read the serial
         (
             "python_validity_fallback",
@@ -171,6 +193,16 @@ fn pairing(
                 .collect()
         })
         .transpose();
+    // Offline checks of what a handshake would use, for a pairing sealed for this host
+    let check = match &sealed_for {
+        Ok(Some(names)) if names.contains(&"dmi") => {
+            match pairing::Pairing::load(&flash, &identities[0].1, &pairing::firmware_key()) {
+                Ok((_, check)) => json!(check),
+                Err(e) => json!({ "error": format!("{e:#}") }),
+            }
+        }
+        _ => Value::Null,
+    };
     report(
         &json!({
             "source": source,
@@ -183,9 +215,66 @@ fn pairing(
                 Ok(None) => json!("no private key block"),
                 Err(e) => json!({ "error": format!("{e:#}") }),
             },
+            "pairing_check": check,
         }),
         output,
     )
+}
+
+fn handshake(serial_file: &Path, output: Option<PathBuf>) -> Result<()> {
+    let (_, keys) = dmi_keys(serial_file)?;
+    let sensor = usb::Sensor::open()?;
+    let mut steps = Map::new();
+    let result = run_handshake(&sensor, &keys, &mut steps);
+    let device = sensor.path.clone();
+    // No reboot or reset: the sensor keeps its TLS session, as with MR 626
+    drop(sensor);
+    if let Err(e) = &result {
+        steps.insert("error".into(), format!("{e:#}").into());
+    }
+    report(&json!({ "device": device, "steps": steps }), output)?;
+    result
+}
+
+fn run_handshake(
+    sensor: &usb::Sensor,
+    keys: &pairing::HostKeys,
+    steps: &mut Map<String, Value>,
+) -> Result<()> {
+    // The plain open sequence python-validity, MR 626 and synafp all send
+    let mut plain = |name: &str, request: &[u8]| -> Result<Vec<u8>> {
+        let response = sensor.cmd(request)?;
+        let (status, _) = proto::split_status(&response)?;
+        steps.insert(name.into(), json!({ "status": format!("{status:04x}") }));
+        ensure!(
+            status == proto::STATUS_OK,
+            "{name} failed with status {status:04x}"
+        );
+        Ok(response)
+    };
+    let rom_info = plain("rom_info", &[0x01])?;
+    plain("get_status", &[0x19])?;
+    // A missing fwext would need the clean-slate blob, which isn't implemented
+    plain("fwext_info", &[0x43, 0x02])?;
+    plain("init_blob", &blobs::INIT)?;
+    let response = plain("read_partition1", &proto::read_flash_request(1, 0, 0x1000))?;
+    let flash = proto::read_flash_data(&response[2..])?;
+
+    let (pairing, check) = pairing::Pairing::load(flash, keys, &pairing::firmware_key())?;
+    steps.insert("pairing_check".into(), json!(check));
+    ensure!(
+        check.sensor_key_signed,
+        "the sensor's ECDH key is not signed by the firmware key"
+    );
+
+    let mut session = tls::connect(sensor, &pairing)?;
+    steps.insert("handshake".into(), "ok".into());
+    let tls_rom_info = session.cmd(sensor, &[0x01])?;
+    steps.insert(
+        "tls_rom_info".into(),
+        json!({ "response": hex(&tls_rom_info), "matches_plain": tls_rom_info == rom_info }),
+    );
+    Ok(())
 }
 
 fn report(value: &Value, output: Option<PathBuf>) -> Result<()> {
