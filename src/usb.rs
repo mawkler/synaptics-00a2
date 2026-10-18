@@ -27,24 +27,45 @@ impl Sensor {
     pub fn open() -> Result<Self> {
         let device = rusb::devices()?
             .iter()
-            .find(|d| d.device_descriptor().is_ok_and(|desc| desc.vendor_id() == VID && desc.product_id() == PID))
+            .find(|d| {
+                d.device_descriptor()
+                    .is_ok_and(|desc| desc.vendor_id() == VID && desc.product_id() == PID)
+            })
             .context("no 06cb:00a2 device found")?;
-        let path = format!("/dev/bus/usb/{:03}/{:03}", device.bus_number(), device.address());
+        let path = format!(
+            "/dev/bus/usb/{:03}/{:03}",
+            device.bus_number(),
+            device.address()
+        );
         // rusb's open_device_with_vid_pid would hide a permission error behind None
-        let handle = device.open().with_context(|| format!("opening {path} (does `getfacl {path}` list your user?)"))?;
+        let handle = device
+            .open()
+            .with_context(|| format!("opening {path} (does `getfacl {path}` list your user?)"))?;
         let config = handle.active_configuration()?;
         if config != 1 {
             bail!("{path} is in configuration {config}, expected 1; refusing to reconfigure it");
         }
-        handle.claim_interface(INTERFACE).with_context(|| format!("claiming interface {INTERFACE} of {path}"))?;
+        handle
+            .claim_interface(INTERFACE)
+            .with_context(|| format!("claiming interface {INTERFACE} of {path}"))?;
         Ok(Self { handle, path })
     }
 
     pub fn cmd(&self, request: &[u8]) -> Result<Vec<u8>> {
-        let written = self.handle.write_bulk(EP_CMD_OUT, request, TIMEOUT).context("sending command")?;
-        ensure!(written == request.len(), "short write: {written} of {} bytes", request.len());
+        let written = self
+            .handle
+            .write_bulk(EP_CMD_OUT, request, TIMEOUT)
+            .context("sending command")?;
+        ensure!(
+            written == request.len(),
+            "short write: {written} of {} bytes",
+            request.len()
+        );
         let mut response = vec![0; MAX_RESPONSE];
-        let read = self.handle.read_bulk(EP_CMD_IN, &mut response, TIMEOUT).context("reading response")?;
+        let read = self
+            .handle
+            .read_bulk(EP_CMD_IN, &mut response, TIMEOUT)
+            .context("reading response")?;
         response.truncate(read);
         Ok(response)
     }

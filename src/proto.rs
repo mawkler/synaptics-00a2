@@ -10,8 +10,28 @@ pub const STATUS_OK: u16 = 0x0000;
 pub const STATUS_NO_FW: u16 = 0x04b0;
 
 pub fn split_status(rsp: &[u8]) -> Result<(u16, &[u8])> {
-    ensure!(rsp.len() >= 2, "response shorter than its status: {} bytes", rsp.len());
+    ensure!(
+        rsp.len() >= 2,
+        "response shorter than its status: {} bytes",
+        rsp.len()
+    );
     Ok((u16::from_le_bytes([rsp[0], rsp[1]]), &rsp[2..]))
+}
+
+/// `0x40` request, `<BBBHLL`: partition, a constant 1, a zero u16, address, size
+pub fn read_flash_request(partition: u8, address: u32, size: u32) -> Vec<u8> {
+    let mut request = vec![0x40, partition, 1, 0, 0];
+    request.extend(address.to_le_bytes());
+    request.extend(size.to_le_bytes());
+    request
+}
+
+/// `0x40` response: a u32 length, two unknown bytes, then the data
+pub fn read_flash_data(payload: &[u8]) -> Result<&[u8]> {
+    let mut r = Le(payload);
+    let size = r.u32()? as usize;
+    r.take(2)?;
+    r.take(size)
 }
 
 /// Little-endian cursor over a payload
@@ -19,7 +39,11 @@ struct Le<'a>(&'a [u8]);
 
 impl<'a> Le<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        ensure!(self.0.len() >= n, "payload truncated: wanted {n} more bytes, have {}", self.0.len());
+        ensure!(
+            self.0.len() >= n,
+            "payload truncated: wanted {n} more bytes, have {}",
+            self.0.len()
+        );
         let (head, tail) = self.0.split_at(n);
         self.0 = tail;
         Ok(head)
@@ -56,7 +80,14 @@ impl RomInfo {
         r.take(1)?;
         let product = r.u8()?;
         r.take(3)?;
-        Ok(Self { timestamp, build, major, minor, product, unknown1: r.u8()? })
+        Ok(Self {
+            timestamp,
+            build,
+            major,
+            minor,
+            product,
+            unknown1: r.u8()?,
+        })
     }
 }
 
@@ -74,7 +105,10 @@ impl SensorId {
         let zero = r.u32()?;
         ensure!(zero == 0, "expected a zero word, got {zero:#x}");
         let minor = r.u16()?;
-        Ok(Self { major: r.u16()?, minor })
+        Ok(Self {
+            major: r.u16()?,
+            minor,
+        })
     }
 }
 
@@ -116,7 +150,14 @@ impl FlashInfo {
                 })
             })
             .collect::<Result<_>>()?;
-        Ok(Self { jedec_id, blocks, unknown0, block_size, unknown1, partitions })
+        Ok(Self {
+            jedec_id,
+            blocks,
+            unknown0,
+            block_size,
+            unknown1,
+            partitions,
+        })
     }
 }
 
@@ -154,7 +195,12 @@ impl FwInfo {
                 })
             })
             .collect::<Result<_>>()?;
-        Ok(Self { major, minor, build_time, modules })
+        Ok(Self {
+            major,
+            minor,
+            build_time,
+            modules,
+        })
     }
 }
 
@@ -164,14 +210,37 @@ mod tests {
 
     fn unhex(s: &str) -> Vec<u8> {
         let s: String = s.split_whitespace().collect();
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
     fn status_is_little_endian() {
-        assert_eq!(split_status(&unhex("b004")).unwrap(), (STATUS_NO_FW, &[][..]));
-        assert_eq!(split_status(&unhex("0000 aa")).unwrap(), (STATUS_OK, &[0xaa][..]));
+        assert_eq!(
+            split_status(&unhex("b004")).unwrap(),
+            (STATUS_NO_FW, &[][..])
+        );
+        assert_eq!(
+            split_status(&unhex("0000 aa")).unwrap(),
+            (STATUS_OK, &[0xaa][..])
+        );
         assert!(split_status(&[0]).is_err());
+    }
+
+    #[test]
+    fn read_flash_matches_python_validity() {
+        // pack('<BBBHLL', 0x40, 1, 1, 0, 0, 0x1000)
+        assert_eq!(
+            read_flash_request(1, 0, 0x1000),
+            unhex("40010100000000000000100000")
+        );
+        assert_eq!(
+            read_flash_data(&unhex("03000000 0000 aabbcc dd")).unwrap(),
+            [0xaa, 0xbb, 0xcc]
+        );
+        assert!(read_flash_data(&unhex("04000000 0000 aabbcc")).is_err());
     }
 
     #[test]
@@ -180,7 +249,14 @@ mod tests {
         let rom = RomInfo::parse(&p).unwrap();
         assert_eq!(
             rom,
-            RomInfo { timestamp: 0x11223344, build: 164, major: 6, minor: 7, product: 0x33, unknown1: 1 }
+            RomInfo {
+                timestamp: 0x11223344,
+                build: 164,
+                major: 6,
+                minor: 7,
+                product: 0x33,
+                unknown1: 1
+            }
         );
         assert!(RomInfo::parse(&p[..15]).is_err());
     }
@@ -189,7 +265,10 @@ mod tests {
     fn sensor_id_requires_zero_word() {
         assert_eq!(
             SensorId::parse(&unhex("00000000 4a00 9001")).unwrap(),
-            SensorId { major: 0x0190, minor: 0x004a }
+            SensorId {
+                major: 0x0190,
+                minor: 0x004a
+            }
         );
         assert!(SensorId::parse(&unhex("01000000 4a00 9001")).is_err());
     }
@@ -207,7 +286,13 @@ mod tests {
         assert_eq!((info.blocks, info.block_size), (0x100, 0x1000));
         assert_eq!(
             info.partitions[1],
-            Partition { id: 2, kind: 1, access_level: 2, offset: 0x2000, size: 0x3e000 }
+            Partition {
+                id: 2,
+                kind: 1,
+                access_level: 2,
+                offset: 0x2000,
+                size: 0x3e000
+            }
         );
         assert!(FlashInfo::parse(&p[..p.len() - 1]).is_err());
     }
@@ -229,7 +314,16 @@ mod tests {
         let fw = FwInfo::parse(&p).unwrap();
         assert_eq!((fw.major, fw.minor, fw.build_time), (1, 1, 0x5a748cc2));
         assert_eq!(fw.modules.len(), 8);
-        assert_eq!(fw.modules[0], Module { kind: 1, subtype: 0x4634, major: 2, minor: 7, size: 0x3ed0 });
+        assert_eq!(
+            fw.modules[0],
+            Module {
+                kind: 1,
+                subtype: 0x4634,
+                major: 2,
+                minor: 7,
+                size: 0x3ed0
+            }
+        );
         assert_eq!(fw.modules[6].size, 0x222f0);
     }
 }
