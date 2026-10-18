@@ -4,6 +4,7 @@
 pub mod blobs;
 pub mod calibrate;
 pub mod capture;
+pub mod device;
 pub mod matcher;
 pub mod pairing;
 pub mod prog;

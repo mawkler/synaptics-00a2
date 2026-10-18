@@ -3,10 +3,7 @@
 //! `0x02` program, follow its events on EP 0x83 until the scan is done, then
 //! fetch the reconstructed image with `0x51`.
 
-use std::{
-    sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Result};
 use serde::Serialize;
@@ -57,13 +54,18 @@ pub enum Scan {
 pub struct Capture<'a> {
     pub session: &'a mut Session,
     pub sensor: &'a Sensor,
-    pub cancelled: &'a AtomicBool,
+    /// Polled while waiting for events; true stops the scan
+    pub cancelled: &'a dyn Fn() -> bool,
     pub events: Vec<Event>,
     started: Instant,
 }
 
 impl<'a> Capture<'a> {
-    pub fn new(session: &'a mut Session, sensor: &'a Sensor, cancelled: &'a AtomicBool) -> Self {
+    pub fn new(
+        session: &'a mut Session,
+        sensor: &'a Sensor,
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> Self {
         Self {
             session,
             sensor,
@@ -87,7 +89,7 @@ impl<'a> Capture<'a> {
     fn event(&mut self, timeout: Duration, waiting_for: &str) -> Result<Vec<u8>> {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.cancelled.load(Ordering::Relaxed) {
+            if (self.cancelled)() {
                 bail!("cancelled while waiting for {waiting_for}");
             }
             if let Some(event) = self.sensor.read_interrupt(POLL)? {
@@ -113,10 +115,11 @@ impl<'a> Capture<'a> {
         command: &[u8],
         finger_timeout: Duration,
         on_ready: impl FnOnce(),
+        on_finger: impl FnOnce(),
     ) -> Result<Scan> {
         self.started = Instant::now();
         self.session.cmd_ok(self.sensor, command)?;
-        let result = self.follow(finger_timeout, on_ready);
+        let result = self.follow(finger_timeout, on_ready, on_finger);
         if !matches!(result, Ok(Scan::Image(_))) {
             // Best effort: the error that got us here matters more
             let _ = self.session.cmd(self.sensor, &CAPTURE_STOP);
@@ -124,7 +127,12 @@ impl<'a> Capture<'a> {
         result
     }
 
-    fn follow(&mut self, finger_timeout: Duration, on_ready: impl FnOnce()) -> Result<Scan> {
+    fn follow(
+        &mut self,
+        finger_timeout: Duration,
+        on_ready: impl FnOnce(),
+        on_finger: impl FnOnce(),
+    ) -> Result<Scan> {
         let start = self.event(START_TIMEOUT, "scan start event")?;
         ensure!(
             start[0] == EVENT_START,
@@ -133,6 +141,7 @@ impl<'a> Capture<'a> {
         );
         on_ready();
         while self.event(finger_timeout, "finger")?[0] != EVENT_FINGER {}
+        on_finger();
         loop {
             let event = self.event(SCAN_TIMEOUT, "end of scan")?;
             ensure!(

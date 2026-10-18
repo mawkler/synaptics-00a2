@@ -173,7 +173,9 @@ impl Matcher {
     pub fn score(&self, probe: &[u8]) -> f64 {
         let probe: Vec<f64> = probe.iter().map(|&p| p as f64).collect();
         let steps: Vec<i32> = ROTATIONS.collect();
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(steps.len());
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(steps.len());
         // Scoped, so no thread outlives the call (the TOD loader may unload this module)
         std::thread::scope(|scope| {
             let workers: Vec<_> = steps
@@ -191,7 +193,10 @@ impl Matcher {
                     })
                 })
                 .collect();
-            workers.into_iter().map(|w| w.join().expect("matcher thread panicked")).fold(-1.0, f64::max)
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("matcher thread panicked"))
+                .fold(-1.0, f64::max)
         })
     }
 
