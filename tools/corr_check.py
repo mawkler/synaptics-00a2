@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 """Correlation-matcher feasibility check (M5 follow-up).
 
-usage: corr_check.py FINGER_A_DIR FINGER_B_DIR
-Enrolls finger A placements 01/04/07/10/13; scores the other A placements
-(genuine) and all B placements (impostor). Prints scores only.
+usage: corr_check.py --enroll PGM... --genuine PGM... --impostor PGM...
+Scores each genuine and impostor probe against the enrolled placements.
+Prints scores only.
 """
 # Prints scores only.
 import sys, re, glob
@@ -51,12 +51,15 @@ def score(probe, gallery):
             best = max(best, masked_ncc(r, m, g, np.ones_like(g)))
     return best
 
-a = sorted(glob.glob(sys.argv[1] + '/finger-a-*.pgm')); b = sorted(glob.glob(sys.argv[2] + '/finger-b-*.pgm'))
-enroll = [load(p) for p in a if re.search(r'-(01|04|07|10|13)\.pgm$', p)]
-genuine = [load(p) for p in a if not re.search(r'-(01|04|07|10|13)\.pgm$', p)]
-impostor = [load(p) for p in b]
-gs = sorted(round(score(p, enroll), 3) for p in genuine)
-im = sorted(round(score(p, enroll), 3) for p in impostor)
-print('genuine  (10):', gs)
-print('impostor (15):', im)
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--enroll', nargs='+', required=True)
+parser.add_argument('--genuine', nargs='+', required=True)
+parser.add_argument('--impostor', nargs='+', required=True)
+args = parser.parse_args()
+enroll = [load(p) for p in args.enroll]
+gs = sorted(round(float(score(load(p), enroll)), 3) for p in args.genuine)
+im = sorted(round(float(score(load(p), enroll)), 3) for p in args.impostor)
+print(f'genuine  ({len(gs)}):', gs)
+print(f'impostor ({len(im)}):', im)
 print(f'separation: min genuine {gs[0]} vs max impostor {im[-1]}')
