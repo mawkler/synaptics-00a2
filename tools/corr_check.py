@@ -51,15 +51,20 @@ def score(probe, gallery):
             best = max(best, masked_ncc(r, m, g, np.ones_like(g)))
     return best
 
-import argparse
-parser = argparse.ArgumentParser()
-parser.add_argument('--enroll', nargs='+', required=True)
-parser.add_argument('--genuine', nargs='+', required=True)
-parser.add_argument('--impostor', nargs='+', required=True)
-args = parser.parse_args()
-enroll = [load(p) for p in args.enroll]
-gs = sorted(round(float(score(load(p), enroll)), 3) for p in args.genuine)
-im = sorted(round(float(score(load(p), enroll)), 3) for p in args.impostor)
-print(f'genuine  ({len(gs)}):', gs)
-print(f'impostor ({len(im)}):', im)
-print(f'separation: min genuine {gs[0]} vs max impostor {im[-1]}')
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--enroll', nargs='+', required=True)
+    parser.add_argument('--genuine', nargs='+', required=True)
+    parser.add_argument('--impostor', nargs='+', required=True)
+    args = parser.parse_args()
+    enroll = [load(p) for p in args.enroll]
+    gs = sorted(round(float(score(load(p), enroll)), 3) for p in args.genuine)
+    im = sorted(round(float(score(load(p), enroll)), 3) for p in args.impostor)
+    print(f'genuine  ({len(gs)}):', gs)
+    print(f'impostor ({len(im)}):', im)
+    print(f'separation: min genuine {gs[0]} vs max impostor {im[-1]}')
+
+
+if __name__ == '__main__':
+    main()
