@@ -129,6 +129,12 @@ enum Command {
         /// Seconds to wait for each touch
         #[arg(long, default_value_t = 30)]
         finger_timeout: u64,
+        /// Also save each scanned image here as LABEL-NN.pgm (mode 0600)
+        #[arg(long)]
+        save_dir: Option<PathBuf>,
+        /// File name prefix for saved images: lowercase letters, digits, dashes
+        #[arg(long, default_value = "identify")]
+        label: String,
         /// Also write the JSON report here (mode 0600)
         #[arg(long)]
         output: Option<PathBuf>,
@@ -218,15 +224,32 @@ fn main() -> Result<()> {
             serial_file,
             attempts,
             finger_timeout,
+            save_dir,
+            label,
             output,
         } => {
+            ensure!(
+                label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "--label may only hold lowercase letters, digits and dashes"
+            );
+            let save = save_dir.map(|dir| (dir, label));
             let cancelled = Arc::new(AtomicBool::new(false));
             for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
                 signal_hook::flag::register(signal, Arc::clone(&cancelled))?;
             }
             let timeout = Duration::from_secs(finger_timeout);
             with_sensor(&serial_file, output, |sensor, keys, steps| {
-                run_chip_identify(sensor, keys, steps, attempts, timeout, &cancelled)
+                run_chip_identify(
+                    sensor,
+                    keys,
+                    steps,
+                    attempts,
+                    timeout,
+                    &cancelled,
+                    save.as_ref(),
+                )
             })
         }
         Command::ChipEnroll {
@@ -667,6 +690,10 @@ fn run_chip_enroll(
 
 /// How long the chip may take to report a match decision
 const MATCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// A finger seen this soon after an identify scan starts was already down
+/// (step 2c: 52 ms for held touches, at least 536 ms for new ones)
+const HELD_FINGER_MS: u128 = 150;
+const MAX_HELD: usize = 100;
 /// Identify-mode scans finish about 0.1 s after the touch without waiting for
 /// a lift, so the next scan would catch the same touch again (step 2a: 3
 /// touches gave 6 decisions). Waiting this long between attempts lets the
@@ -680,6 +707,7 @@ fn run_chip_identify(
     attempts: usize,
     finger_timeout: Duration,
     cancelled: &AtomicBool,
+    save: Option<&(PathBuf, String)>,
 ) -> Result<()> {
     let mut scanner = device::Scanner::open(sensor, keys, &mut log(steps))?;
 
@@ -712,7 +740,7 @@ fn run_chip_identify(
     );
 
     let is_cancelled = || cancelled.load(Ordering::Relaxed);
-    let (mut results, mut rejected) = (Vec::new(), 0);
+    let (mut results, mut rejected, mut held) = (Vec::new(), 0, 0);
     let mut failure = None;
     while results.len() < attempts {
         let attempt = results.len() + 1;
@@ -739,6 +767,27 @@ fn run_chip_identify(
                 }
             }
             Ok(capture::Scan::Image(image)) => {
+                // A finger already down when the scan started is the previous
+                // touch, still held: don't count it, try again shortly
+                let finger_ms = events
+                    .iter()
+                    .find(|e| e.bytes.starts_with("02"))
+                    .map(|e| e.ms);
+                if attempt > 1 && finger_ms.is_some_and(|ms| ms < HELD_FINGER_MS) {
+                    held += 1;
+                    ensure!(
+                        held <= MAX_HELD,
+                        "the finger stayed on the sensor for too long"
+                    );
+                    std::thread::sleep(Duration::from_millis(300));
+                    continue;
+                }
+                if let (Some((dir, label)), false) = (save, image.pixels.is_empty()) {
+                    write_private(
+                        &dir.join(format!("{label}-{attempt:02}.pgm")),
+                        &pgm(image.width, image.height, &image.pixels),
+                    )?;
+                }
                 let decision = chip_match(&mut scanner);
                 let mut entry = json!({ "attempt": attempt, "result_pixels": image.pixels.len(), "stale_events": stale, "events": events });
                 match decision {
