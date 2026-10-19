@@ -17,7 +17,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use syna_00a2::{capture, device, matcher, pairing, proto, tables, usb};
+use syna_00a2::{capture, db, device, matcher, pairing, proto, tables, usb};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -100,6 +100,21 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Read-only look at the sensor's template database (flash partition 4):
+    /// the record tree with types and sizes, storage names, and optionally a
+    /// full backup of the partition (mode 0600). Reads no user identities or
+    /// template contents into the report, and writes nothing to the sensor.
+    Db {
+        /// File holding the DMI product serial (root-only in sysfs)
+        #[arg(long)]
+        serial_file: PathBuf,
+        /// Save a full copy of partition 4 here (mode 0600; it may hold templates)
+        #[arg(long)]
+        backup: Option<PathBuf>,
+        /// Also write the JSON report here (mode 0600)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Offline: scores probe images against a template built from enrolled
     /// images, as the driver's matcher does. Prints scores only.
     Score {
@@ -159,6 +174,13 @@ fn main() -> Result<()> {
             probe,
             prepare,
         } => score(&enroll, &probe, &prepare),
+        Command::Db {
+            serial_file,
+            backup,
+            output,
+        } => with_sensor(&serial_file, output, |sensor, keys, steps| {
+            run_db(sensor, keys, steps, backup.as_deref())
+        }),
         Command::Capture {
             serial_file,
             out_dir,
@@ -392,6 +414,95 @@ fn run_calibrate(
         &out_dir.join("blank.pgm"),
         &pgm(tables::LINE_WIDTH, rows, &device::pixels(&calibrated.blank)),
     )?;
+    Ok(())
+}
+
+/// Records to walk at most, in case the tree is not what python-validity describes
+const MAX_RECORDS: usize = 500;
+
+fn run_db(
+    sensor: usb::Sensor,
+    keys: &pairing::HostKeys,
+    steps: &mut Map<String, Value>,
+    backup: Option<&Path>,
+) -> Result<()> {
+    let (mut session, _) = device::open_session(&sensor, keys, &mut log(steps))?;
+    let info = db::parse_info(&session.cmd_ok(&sensor, &db::info_request())?)?;
+    steps.insert("db_info".into(), json!(info));
+
+    // Walk the tree through 0x46 only: types and sizes, not values. Storage
+    // records carry just a name, so those values are read too.
+    let (mut records, mut kinds) = (
+        Vec::new(),
+        std::collections::BTreeMap::<String, usize>::new(),
+    );
+    let mut queue: std::collections::VecDeque<u16> = info.roots.iter().copied().collect();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(dbid) = queue.pop_front() {
+        if !seen.insert(dbid) || records.len() >= MAX_RECORDS {
+            continue;
+        }
+        let record = db::parse_children(&session.cmd_ok(&sensor, &db::children_request(dbid))?)?;
+        let mut entry = json!({
+            "dbid": record.dbid,
+            "kind": record.kind,
+            "kind_name": db::kind_name(record.kind),
+            "storage": record.storage,
+            "value_size": record.value_size,
+            "children": record.children.iter().map(|c| c.dbid).collect::<Vec<_>>(),
+        });
+        if record.kind == 4 {
+            let (_, value) = db::parse_value(&session.cmd_ok(&sensor, &db::value_request(dbid))?)?;
+            entry["name"] = String::from_utf8_lossy(&value)
+                .trim_end_matches('\0')
+                .into();
+        }
+        *kinds
+            .entry(db::kind_name(record.kind).to_owned())
+            .or_default() += 1;
+        records.push(entry);
+        queue.extend(record.children.iter().map(|c| c.dbid));
+    }
+    steps.insert("records".into(), json!(records));
+    steps.insert("record_kinds".into(), json!(kinds));
+
+    let response = session.cmd(&sensor, &db::user_storage_request("StgWindsor"))?;
+    let (status, payload) = proto::split_status(&response)?;
+    let storage = match status {
+        proto::STATUS_OK => json!(db::parse_user_storage(payload)?),
+        db::STATUS_NOT_FOUND => "not found".into(),
+        other => json!({ "status": format!("{other:04x}") }),
+    };
+    steps.insert("stg_windsor".into(), storage);
+
+    if let Some(path) = backup {
+        let flash = proto::FlashInfo::parse(&session.cmd_ok(&sensor, &[0x3e])?)?;
+        let partition = flash
+            .partitions
+            .iter()
+            .find(|p| p.id == 4)
+            .context("no partition 4")?;
+        let size = partition.size as usize;
+        let mut data = Vec::with_capacity(size);
+        while data.len() < size {
+            let chunk = device::read_flash_tls(
+                &mut session,
+                &sensor,
+                4,
+                data.len() as u32,
+                (size - data.len()).min(0x1000) as u32,
+            )?;
+            ensure!(!chunk.is_empty(), "partition 4 read returned nothing");
+            data.extend(chunk);
+        }
+        data.truncate(size);
+        write_private(path, &data)?;
+        let erased = data.iter().filter(|&&b| b == 0xff).count() as f64 / size as f64;
+        steps.insert(
+            "partition4_backup".into(),
+            json!({ "bytes": size, "sha256": hex(&Sha256::digest(&data)), "erased_fraction": (erased * 1000.0).round() / 1000.0 }),
+        );
+    }
     Ok(())
 }
 
