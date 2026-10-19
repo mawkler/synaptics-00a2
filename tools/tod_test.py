@@ -21,6 +21,7 @@ match scores, never image data; serialized prints are written mode 0600.
 """
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -272,7 +273,11 @@ def main():
             close_device(dev)
             wait(lambda: 'added' in seen, 'the new device', seconds=120)
             event('device_added')
-            dev = state['dev'] = seen['added']
+            # Drop the removed device now (fprintd unrefs it too): kept alive
+            # past the GUsb context, it crashed the process at exit
+            del dev
+            gc.collect()
+            dev = state['dev'] = seen.pop('added')
             watch(dev)
             open_device(dev)
             report['results'] = attempts(dev, prints, 'verify', 1)
@@ -288,6 +293,7 @@ def main():
             os.write(fd, json.dumps(report, indent=1).encode())
             os.close(fd)
         state.clear()
+        gc.collect()
         del context
     sys.exit(1 if 'error' in report else 0)
 
