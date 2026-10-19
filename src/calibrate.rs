@@ -53,7 +53,6 @@ fn reconstruction(mode_byte: u8) -> Vec<u8> {
 pub enum Mode {
     Calibrate,
     Enroll,
-    #[allow(dead_code)] // for verification scans (M6); tested against python-validity
     Identify,
 }
 

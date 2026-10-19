@@ -175,6 +175,17 @@ impl<'a> Capture<'a> {
             return Ok(Scan::Rejected(error));
         }
         let mut pixels = data[12..].to_vec();
+        // python-validity only expects pixels after the header when there are
+        // any; a scan for on-chip matching may return just the header
+        if pixels.is_empty() {
+            return Ok(Scan::Image(Image {
+                width,
+                height,
+                w1,
+                w2,
+                pixels,
+            }));
+        }
         for _ in 0..MAX_RESULT_READS {
             if pixels.len() >= width * height {
                 break;

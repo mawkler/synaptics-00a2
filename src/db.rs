@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! The sensor's template database (flash partition 4), following
-//! python-validity's `validitysensor/db.py`. Only the read commands so far:
-//! 0x45 info, 0x46 record children, 0x49 record value, 0x4b user storage.
-//! Responses are TLS payloads with the status already stripped.
+//! python-validity's `validitysensor/db.py` and `sensor.py`. Only reads and
+//! the on-chip identify so far: 0x45 info, 0x46 record children, 0x49 record
+//! value, 0x4a user, 0x4b user storage; 0x5e/0x60/0x62 match. Responses are
+//! TLS payloads with the status already stripped.
 
 use anyhow::{ensure, Result};
 use serde::Serialize;
@@ -160,6 +161,116 @@ pub fn parse_user_storage(p: &[u8]) -> Result<UserStorage> {
     })
 }
 
+#[derive(Debug, PartialEq, Serialize)]
+pub struct Finger {
+    pub dbid: u16,
+    pub subtype: u16,
+    pub storage: u16,
+    pub value_size: u16,
+}
+
+/// `0x4a` by dbid: `<BHHH`, dbid, then two zeros (no identity search)
+pub fn user_request(dbid: u16) -> Vec<u8> {
+    let mut request = vec![0x4a];
+    request.extend(dbid.to_le_bytes());
+    request.extend([0; 4]);
+    request
+}
+
+/// dbid, finger count, 2 unknown bytes, identity size, (dbid, subtype,
+/// storage, value size) per finger, then the identity, which is skipped:
+/// it is the Windows account's SID
+pub fn parse_user_fingers(p: &[u8]) -> Result<(u16, Vec<Finger>)> {
+    let count = u16_at(p, 2)? as usize;
+    let identity_size = u16_at(p, 6)? as usize;
+    ensure!(
+        p.len() == 8 + 8 * count + identity_size,
+        "unexpected user record length"
+    );
+    let fingers = (0..count)
+        .map(|i| {
+            let at = 8 + 8 * i;
+            Ok(Finger {
+                dbid: u16_at(p, at)?,
+                subtype: u16_at(p, at + 2)?,
+                storage: u16_at(p, at + 4)?,
+                value_size: u16_at(p, at + 6)?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    Ok((u16_at(p, 0)?, fingers))
+}
+
+/// Finger names for WinBio subtypes (python-validity's fingerprint_constants)
+pub fn subtype_name(subtype: u16) -> String {
+    const NAMES: [&str; 10] = [
+        "right thumb",
+        "right index",
+        "right middle",
+        "right ring",
+        "right little",
+        "left thumb",
+        "left index",
+        "left middle",
+        "left ring",
+        "left little",
+    ];
+    match subtype {
+        1..=10 => NAMES[subtype as usize - 1].to_owned(),
+        0xf5..=0xfe => format!("unspecified position {}", subtype - 0xf4),
+        _ => format!("unknown ({subtype:#x})"),
+    }
+}
+
+/// Starts an on-chip identify of the last scan against every storage and
+/// user: `<BBBHHHHH` 0x5e, 2, 0xff, storage 0, user 0, 1, 0, 0
+pub const MATCH_REQUEST: [u8; 13] = [0x5e, 0x02, 0xff, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0];
+/// Fetches the match result after the "recognised" event
+pub const MATCH_RESULT_REQUEST: [u8; 5] = [0x60, 0, 0, 0, 0];
+/// Ends the identify; python-validity always sends it and ignores errors
+pub const MATCH_CLEANUP_REQUEST: [u8; 5] = [0x62, 0, 0, 0, 0];
+/// First byte of the event that reports a recognised finger
+pub const EVENT_RECOGNISED: u8 = 3;
+
+#[derive(Debug, PartialEq, Serialize)]
+pub struct MatchResult {
+    pub user: u32,
+    pub subtype: u16,
+    /// The template's identify hash, a stable per-enrollment id
+    pub hash: String,
+}
+
+/// u16 length, then (u16 tag, u16 length, value) entries: 1 user, 3 subtype, 4 hash
+pub fn parse_match_result(p: &[u8]) -> Result<MatchResult> {
+    let len = u16_at(p, 0)? as usize;
+    ensure!(p.len() == 2 + len, "match result length mismatch");
+    let mut entries = std::collections::BTreeMap::new();
+    let mut at = 2;
+    while at < p.len() {
+        let (tag, size) = (u16_at(p, at)?, u16_at(p, at + 2)? as usize);
+        ensure!(p.len() >= at + 4 + size, "match result entry overruns");
+        entries.insert(tag, &p[at + 4..at + 4 + size]);
+        at += 4 + size;
+    }
+    let field = |tag: u16| {
+        entries
+            .get(&tag)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("match result has no field {tag}"))
+    };
+    let user = field(1)?;
+    let subtype = field(3)?;
+    ensure!(
+        user.len() == 4 && subtype.len() == 2,
+        "unexpected match result field sizes"
+    );
+    Ok(MatchResult {
+        user: u32::from_le_bytes(user.try_into()?),
+        subtype: u16::from_le_bytes(subtype.try_into()?),
+        hash: field(4)?.iter().map(|b| format!("{b:02x}")).collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +293,53 @@ mod tests {
             [&unhex("4b00000b00")[..], b"StgWindsor\0"].concat()
         );
         assert_eq!(user_storage_request(""), unhex("4b00000000"));
+    }
+
+    #[test]
+    fn match_requests_match_python_validity() {
+        // pack('<BBBHHHHH', 0x5e, 2, 0xff, 0, 0, 1, 0, 0)
+        assert_eq!(
+            MATCH_REQUEST.to_vec(),
+            unhex("5e02ff 0000 0000 0100 0000 0000")
+        );
+        assert_eq!(user_request(5), unhex("4a 0500 0000 0000"));
+    }
+
+    #[test]
+    fn parses_users_and_match_results() {
+        let p = [
+            &unhex("0500 0100 0000 0400 0600 f500 0300 c85a")[..],
+            &[0xaa; 4],
+        ]
+        .concat();
+        let (dbid, fingers) = parse_user_fingers(&p).unwrap();
+        assert_eq!(dbid, 5);
+        assert_eq!(
+            fingers,
+            [Finger {
+                dbid: 6,
+                subtype: 0xf5,
+                storage: 3,
+                value_size: 0x5ac8
+            }]
+        );
+        assert!(parse_user_fingers(&p[..p.len() - 1]).is_err());
+        assert_eq!(subtype_name(0xf5), "unspecified position 1");
+        assert_eq!(subtype_name(2), "right index");
+
+        let result = parse_match_result(&unhex(
+            "1400 0100 0400 05000000 0300 0200 f500 0400 0200 abcd",
+        ))
+        .unwrap();
+        assert_eq!(
+            result,
+            MatchResult {
+                user: 5,
+                subtype: 0xf5,
+                hash: "abcd".into()
+            }
+        );
+        assert!(parse_match_result(&unhex("0400 0100 0400")).is_err());
     }
 
     #[test]

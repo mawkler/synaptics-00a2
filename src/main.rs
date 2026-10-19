@@ -17,7 +17,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use syna_00a2::{capture, db, device, matcher, pairing, proto, tables, usb};
+use syna_00a2::{calibrate, capture, db, device, matcher, pairing, proto, tables, usb};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -115,6 +115,24 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// On-chip matching against the templates already in the sensor's
+    /// database: identify-mode scans, each matched by the chip itself (0x5e,
+    /// 0x60, then 0x62). Lists the stored fingers by subtype only. Sends no
+    /// database writes.
+    ChipIdentify {
+        /// File holding the DMI product serial (root-only in sysfs)
+        #[arg(long)]
+        serial_file: PathBuf,
+        /// Touches to match
+        #[arg(long, default_value_t = 6)]
+        attempts: usize,
+        /// Seconds to wait for each touch
+        #[arg(long, default_value_t = 30)]
+        finger_timeout: u64,
+        /// Also write the JSON report here (mode 0600)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Offline: scores probe images against a template built from enrolled
     /// images, as the driver's matcher does. Prints scores only.
     Score {
@@ -174,6 +192,21 @@ fn main() -> Result<()> {
             probe,
             prepare,
         } => score(&enroll, &probe, &prepare),
+        Command::ChipIdentify {
+            serial_file,
+            attempts,
+            finger_timeout,
+            output,
+        } => {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+                signal_hook::flag::register(signal, Arc::clone(&cancelled))?;
+            }
+            let timeout = Duration::from_secs(finger_timeout);
+            with_sensor(&serial_file, output, |sensor, keys, steps| {
+                run_chip_identify(sensor, keys, steps, attempts, timeout, &cancelled)
+            })
+        }
         Command::Db {
             serial_file,
             backup,
@@ -504,6 +537,149 @@ fn run_db(
         );
     }
     Ok(())
+}
+
+/// How long the chip may take to report a match decision
+const MATCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn run_chip_identify(
+    sensor: usb::Sensor,
+    keys: &pairing::HostKeys,
+    steps: &mut Map<String, Value>,
+    attempts: usize,
+    finger_timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    let mut scanner = device::Scanner::open(sensor, keys, &mut log(steps))?;
+
+    // The stored fingers, by subtype only: user records hold Windows SIDs
+    let response = scanner
+        .session
+        .cmd(&scanner.sensor, &db::user_storage_request("StgWindsor"))?;
+    let (status, payload) = proto::split_status(&response)?;
+    ensure!(
+        status == proto::STATUS_OK,
+        "no StgWindsor storage (status {status:04x})"
+    );
+    let mut stored = Vec::new();
+    for (user, _) in db::parse_user_storage(payload)?.users {
+        let (_, fingers) = db::parse_user_fingers(
+            &scanner
+                .session
+                .cmd_ok(&scanner.sensor, &db::user_request(user))?,
+        )?;
+        let fingers: Vec<_> = fingers
+            .iter()
+            .map(|f| json!({ "dbid": f.dbid, "subtype": f.subtype, "finger": db::subtype_name(f.subtype), "value_size": f.value_size }))
+            .collect();
+        stored.push(json!({ "user": user, "fingers": fingers }));
+    }
+    steps.insert("stored_fingers".into(), json!(stored));
+    ensure!(
+        !cancelled.load(Ordering::Relaxed),
+        "cancelled before the first scan"
+    );
+
+    let is_cancelled = || cancelled.load(Ordering::Relaxed);
+    let (mut results, mut rejected) = (Vec::new(), 0);
+    let mut failure = None;
+    while results.len() < attempts {
+        let attempt = results.len() + 1;
+        let (scan, events, stale) = scanner.scan(
+            calibrate::Mode::Identify,
+            finger_timeout,
+            &is_cancelled,
+            || {
+                println!("PLACE YOUR FINGER on the sensor now ({attempt}/{attempts})");
+                let _ = std::io::stdout().flush();
+            },
+            || {},
+        );
+        match scan {
+            Ok(capture::Scan::Rejected(code)) => {
+                rejected += 1;
+                steps.insert(
+                    format!("rejected_{rejected}"),
+                    json!({ "code": format!("{code:#x}"), "events": events }),
+                );
+                if rejected > MAX_REJECTED {
+                    failure = Some(anyhow::anyhow!("{rejected} placements rejected"));
+                    break;
+                }
+            }
+            Ok(capture::Scan::Image(image)) => {
+                let decision = chip_match(&mut scanner);
+                let mut entry = json!({ "attempt": attempt, "result_pixels": image.pixels.len(), "stale_events": stale, "events": events });
+                match decision {
+                    Ok(decision) => entry["match"] = decision,
+                    Err(e) => {
+                        entry["error"] = format!("{e:#}").into();
+                        failure = Some(e);
+                    }
+                }
+                results.push(entry);
+                if failure.is_some() {
+                    break;
+                }
+            }
+            Err(e) => {
+                results.push(
+                    json!({ "attempt": attempt, "error": format!("{e:#}"), "events": events }),
+                );
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    steps.insert("attempts".into(), json!(results));
+    failure.map_or(Ok(()), Err)
+}
+
+/// The chip's own match of the last identify-mode scan against everything
+/// stored, as python-validity's `Sensor.match_finger`. The cleanup command
+/// is always sent; its result is reported but not checked.
+fn chip_match(scanner: &mut device::Scanner) -> Result<Value> {
+    let decision = (|| -> Result<Value> {
+        scanner
+            .session
+            .cmd_ok(&scanner.sensor, &db::MATCH_REQUEST)?;
+        let deadline = std::time::Instant::now() + MATCH_TIMEOUT;
+        let event = loop {
+            if let Some(event) = scanner.sensor.read_interrupt(Duration::from_millis(100))? {
+                break event;
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "no match decision within {} s",
+                MATCH_TIMEOUT.as_secs()
+            );
+        };
+        if event.first() != Some(&db::EVENT_RECOGNISED) {
+            return Ok(json!({ "recognised": false, "event": hex(&event) }));
+        }
+        let result = db::parse_match_result(
+            &scanner
+                .session
+                .cmd_ok(&scanner.sensor, &db::MATCH_RESULT_REQUEST)?,
+        )?;
+        Ok(json!({
+            "recognised": true,
+            "event": hex(&event),
+            "user": result.user,
+            "subtype": result.subtype,
+            "finger": db::subtype_name(result.subtype),
+            "hash_prefix": &result.hash[..result.hash.len().min(16)],
+        }))
+    })();
+    let cleanup = scanner
+        .session
+        .cmd(&scanner.sensor, &db::MATCH_CLEANUP_REQUEST);
+    let mut decision = decision?;
+    decision["cleanup"] = match cleanup {
+        Ok(response) => hex(&response).into(),
+        Err(e) => format!("error: {e:#}").into(),
+    };
+    Ok(decision)
 }
 
 /// Rejected placements (sensor scan errors) tolerated per capture run

@@ -253,7 +253,8 @@ pub fn calibrate_in_memory(
 pub struct Scanner {
     pub sensor: usb::Sensor,
     pub session: tls::Session,
-    command: Vec<u8>,
+    enroll: Vec<u8>,
+    identify: Vec<u8>,
 }
 
 impl Scanner {
@@ -276,11 +277,13 @@ impl Scanner {
             )?;
             diff = calibrated.blank_vs_flash.unwrap_or(f64::INFINITY);
             if diff <= MAX_BLANK_DIFF {
-                let command = calibrated.calibration.command(calibrate::Mode::Enroll)?;
+                let enroll = calibrated.calibration.command(calibrate::Mode::Enroll)?;
+                let identify = calibrated.calibration.command(calibrate::Mode::Identify)?;
                 return Ok(Self {
                     sensor,
                     session,
-                    command,
+                    enroll,
+                    identify,
                 });
             }
             log(
@@ -303,12 +306,35 @@ impl Scanner {
         on_ready: impl FnOnce(),
         on_finger: impl FnOnce(),
     ) -> (Result<Scan>, Vec<crate::capture::Event>, Vec<String>) {
+        self.scan(
+            calibrate::Mode::Enroll,
+            finger_timeout,
+            cancelled,
+            on_ready,
+            on_finger,
+        )
+    }
+
+    /// One scan in the given mode (enroll, or identify for on-chip matching)
+    pub fn scan(
+        &mut self,
+        mode: calibrate::Mode,
+        finger_timeout: Duration,
+        cancelled: &dyn Fn() -> bool,
+        on_ready: impl FnOnce(),
+        on_finger: impl FnOnce(),
+    ) -> (Result<Scan>, Vec<crate::capture::Event>, Vec<String>) {
         let mut capture = Capture::new(&mut self.session, &self.sensor, cancelled);
         let stale = match capture.drain() {
             Ok(stale) => stale,
             Err(e) => return (Err(e), Vec::new(), Vec::new()),
         };
-        let result = capture.scan(&self.command, finger_timeout, on_ready, on_finger);
+        let command = if mode == calibrate::Mode::Identify {
+            &self.identify
+        } else {
+            &self.enroll
+        };
+        let result = capture.scan(command, finger_timeout, on_ready, on_finger);
         (result, std::mem::take(&mut capture.events), stale)
     }
 }
