@@ -222,6 +222,31 @@ pub fn subtype_name(subtype: u16) -> String {
     }
 }
 
+/// `0x47` new record, `<BHHHH`: parent, type, storage, value size, then the
+/// value and an uncounted trailer (python-validity's MoH finger store sends
+/// one 0x00 byte). Must follow the `db_write_enable` blob; the response
+/// payload is the new record's dbid.
+pub fn new_record_request(
+    parent: u16,
+    kind: u16,
+    storage: u16,
+    value: &[u8],
+    trailer: &[u8],
+) -> Vec<u8> {
+    let mut request = vec![0x47];
+    for field in [parent, kind, storage, value.len() as u16] {
+        request.extend(field.to_le_bytes());
+    }
+    request.extend(value);
+    request.extend(trailer);
+    request
+}
+
+/// `0x1a` (python-validity's `call_cleanups`), sent after every write
+pub const COMMIT_REQUEST: [u8; 1] = [0x1a];
+/// `0x1a` status when there is nothing to commit, which is not an error
+pub const STATUS_NOTHING_TO_COMMIT: u16 = 0x0491;
+
 /// Starts an on-chip identify of the last scan against every storage and
 /// user: `<BBBHHHHH` 0x5e, 2, 0xff, storage 0, user 0, 1, 0, 0
 pub const MATCH_REQUEST: [u8; 13] = [0x5e, 0x02, 0xff, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0];
@@ -293,6 +318,15 @@ mod tests {
             [&unhex("4b00000b00")[..], b"StgWindsor\0"].concat()
         );
         assert_eq!(user_storage_request(""), unhex("4b00000000"));
+    }
+
+    #[test]
+    fn new_record_matches_python_validity() {
+        // pack('<BHHHH', 0x47, 5, 6, 3, 4) + data + b'\x00'
+        assert_eq!(
+            new_record_request(5, 6, 3, &[1, 2, 3, 4], &[0]),
+            unhex("47 0500 0600 0300 0400 01020304 00")
+        );
     }
 
     #[test]

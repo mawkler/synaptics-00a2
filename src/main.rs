@@ -17,7 +17,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use syna_00a2::{calibrate, capture, db, device, matcher, pairing, proto, tables, usb};
+use syna_00a2::{blobs, calibrate, capture, db, device, matcher, pairing, proto, tables, usb};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -133,6 +133,28 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// DATABASE WRITE. Stores one template envelope (built offline) as a new
+    /// finger record in the sensor's template database, under an existing
+    /// user record: the db_write_enable blob, then 0x47, then 0x1a. Refuses to
+    /// run unless --confirm is the envelope's SHA-256. Writes nothing else.
+    ChipEnroll {
+        /// File holding the DMI product serial (root-only in sysfs)
+        #[arg(long)]
+        serial_file: PathBuf,
+        /// The 23136-byte template envelope
+        #[arg(long)]
+        envelope: PathBuf,
+        /// Existing user record to file the finger under. python-validity: the
+        /// chip's matcher never finds a finger under a user that doesn't exist.
+        #[arg(long)]
+        parent: u16,
+        /// The envelope's SHA-256, as shown when the write was approved
+        #[arg(long)]
+        confirm: String,
+        /// Also write the JSON report here (mode 0600)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Offline: scores probe images against a template built from enrolled
     /// images, as the driver's matcher does. Prints scores only.
     Score {
@@ -205,6 +227,29 @@ fn main() -> Result<()> {
             let timeout = Duration::from_secs(finger_timeout);
             with_sensor(&serial_file, output, |sensor, keys, steps| {
                 run_chip_identify(sensor, keys, steps, attempts, timeout, &cancelled)
+            })
+        }
+        Command::ChipEnroll {
+            serial_file,
+            envelope,
+            parent,
+            confirm,
+            output,
+        } => {
+            let envelope =
+                fs::read(&envelope).with_context(|| format!("reading {}", envelope.display()))?;
+            let hash = hex(&Sha256::digest(&envelope));
+            ensure!(
+                hash == confirm.to_lowercase(),
+                "--confirm does not match the envelope's SHA-256 {hash}; nothing was sent"
+            );
+            ensure!(
+                envelope.len() == MOH_ENVELOPE_SIZE,
+                "a MoH envelope is {MOH_ENVELOPE_SIZE} bytes, not {}",
+                envelope.len()
+            );
+            with_sensor(&serial_file, output, |sensor, keys, steps| {
+                run_chip_enroll(sensor, keys, steps, &envelope, parent)
             })
         }
         Command::Db {
@@ -536,6 +581,87 @@ fn run_db(
             json!({ "bytes": size, "sha256": hex(&Sha256::digest(&data)), "erased_fraction": (erased * 1000.0).round() / 1000.0 }),
         );
     }
+    Ok(())
+}
+
+/// Size of python-validity's (and the DLL's) MoH template envelope
+const MOH_ENVELOPE_SIZE: usize = 23136;
+/// Record type python-validity stores MoH fingers as
+const MOH_FINGER_KIND: u16 = 6;
+
+fn run_chip_enroll(
+    sensor: usb::Sensor,
+    keys: &pairing::HostKeys,
+    steps: &mut Map<String, Value>,
+    envelope: &[u8],
+    parent: u16,
+) -> Result<()> {
+    let (mut session, _) = device::open_session(&sensor, keys, &mut log(steps))?;
+    // Checks first, all reads
+    let before = db::parse_info(&session.cmd_ok(&sensor, &db::info_request())?)?;
+    ensure!(
+        before.free as usize > envelope.len() + 4096,
+        "not enough free space in the template database"
+    );
+    let response = session.cmd(&sensor, &db::user_storage_request("StgWindsor"))?;
+    let (status, payload) = proto::split_status(&response)?;
+    ensure!(
+        status == proto::STATUS_OK,
+        "no StgWindsor storage (status {status:04x}); nothing was written"
+    );
+    let storage = db::parse_user_storage(payload)?;
+    ensure!(
+        storage.users.iter().any(|&(user, _)| user == parent),
+        "user record {parent} is not in StgWindsor; nothing was written"
+    );
+    let children = |session: &mut syna_00a2::tls::Session| -> Result<Vec<u16>> {
+        Ok(
+            db::parse_children(&session.cmd_ok(&sensor, &db::children_request(parent))?)?
+                .children
+                .iter()
+                .map(|c| c.dbid)
+                .collect(),
+        )
+    };
+    steps.insert(
+        "before".into(),
+        json!({ "db_info": before, "parent_children": children(&mut session)? }),
+    );
+
+    // The write: unlock, store, commit (always, as python-validity does)
+    session
+        .cmd_ok(&sensor, &blobs::DB_WRITE_ENABLE)
+        .context("db_write_enable; nothing was written")?;
+    let request = db::new_record_request(parent, MOH_FINGER_KIND, storage.dbid, envelope, &[0]);
+    let stored = session.cmd(&sensor, &request);
+    let commit = session.cmd(&sensor, &db::COMMIT_REQUEST);
+    let stored = stored?;
+    let (status, payload) = proto::split_status(&stored)?;
+    let commit_status = proto::split_status(&commit?)?.0;
+    steps.insert(
+        "write".into(),
+        json!({
+            "header": hex(&request[..9]),
+            "store_status": format!("{status:04x}"),
+            "commit_status": format!("{commit_status:04x}"),
+        }),
+    );
+    ensure!(
+        status == proto::STATUS_OK,
+        "the sensor refused the record (status {status:04x})"
+    );
+    ensure!(
+        [proto::STATUS_OK, db::STATUS_NOTHING_TO_COMMIT].contains(&commit_status),
+        "commit failed with status {commit_status:04x}"
+    );
+    ensure!(payload.len() >= 2, "no record id in the response");
+    let dbid = u16::from_le_bytes([payload[0], payload[1]]);
+
+    let after = db::parse_info(&session.cmd_ok(&sensor, &db::info_request())?)?;
+    steps.insert(
+        "after".into(),
+        json!({ "new_record": dbid, "db_info": after, "parent_children": children(&mut session)? }),
+    );
     Ok(())
 }
 
