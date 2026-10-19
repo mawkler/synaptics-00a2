@@ -9,8 +9,10 @@
  * Templates are the enrolled images, stored host-side by fprintd.
  */
 
+#define _GNU_SOURCE /* dladdr */
 #define FP_COMPONENT "syna_00a2"
 
+#include <dlfcn.h>
 #include <math.h>
 
 #include "drivers_api.h"
@@ -445,6 +447,21 @@ syna_cancel (FpDevice *device)
   g_atomic_int_set (&FPI_DEVICE_SYNA_00A2 (device)->cancelling, TRUE);
 }
 
+/* G_DEFINE_TYPE registers a static type, which GLib can't unregister, but
+ * libfprint-tod g_module_close()s drivers when a context is torn down. A
+ * device that outlived its context then finalized in unloaded code: a
+ * segfault at exit (robustness run r1, reproduced without device I/O). So
+ * the module stays loaded for good. */
+static void
+pin_module (void)
+{
+  Dl_info info;
+
+  if (!dladdr ((void *) pin_module, &info) || !info.dli_fname ||
+      !dlopen (info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE))
+    fp_warn ("Could not keep the driver module loaded; exiting with devices still alive may crash");
+}
+
 static void
 fpi_device_syna_00a2_init (FpiDeviceSyna00a2 *self)
 {
@@ -466,6 +483,7 @@ fpi_device_syna_00a2_class_init (FpiDeviceSyna00a2Class *klass)
 {
   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
 
+  pin_module ();
   G_OBJECT_CLASS (klass)->finalize = fpi_device_syna_00a2_finalize;
 
   dev_class->id = FP_COMPONENT;
