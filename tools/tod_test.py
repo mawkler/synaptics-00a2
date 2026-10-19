@@ -35,6 +35,7 @@ def main():
     parser.add_argument('--drivers', required=True, help='directory holding libsyna_00a2_tod.so')
     parser.add_argument('--serial-file', required=True, help='private copy of the DMI serial (sysfs needs root)')
     parser.add_argument('--output', help='also write the JSON report here (0600)')
+    parser.add_argument('--trace', help="have the driver append each scan's raw events here (SYNA_00A2_TRACE)")
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('enroll').add_argument('--out', required=True)
     for name in ('verify', 'identify'):
@@ -51,6 +52,8 @@ def main():
     os.environ['GI_TYPELIB_PATH'] = args.typelib + os.pathsep + os.environ.get('GI_TYPELIB_PATH', '')
     os.environ['FP_TOD_DRIVERS_DIR'] = os.path.abspath(args.drivers)
     os.environ['SYNA_00A2_SERIAL_FILE'] = os.path.abspath(args.serial_file)
+    if args.trace:
+        os.environ['SYNA_00A2_TRACE'] = os.path.abspath(args.trace)
 
     import gi
     gi.require_version('FPrint', '2.0')
@@ -93,6 +96,10 @@ def main():
     def wait(done, what, seconds=120, action=None):
         deadline = time.monotonic() + seconds
         while not done():
+            # Waits with a running action end when the action is cancelled;
+            # other waits end here once a stop was requested
+            if action is None and cancellable.is_cancelled():
+                raise RuntimeError(f'stopped while waiting for {what}')
             if time.monotonic() > deadline:
                 if action is None or action.is_cancelled():
                     raise TimeoutError(f'no {what} within the time limit')
@@ -251,21 +258,20 @@ def main():
             prints = load_prints()
             seen = {}
 
-            def removed(ctx, d):
-                if d.get_driver() == 'syna_00a2':
-                    seen.setdefault('removed', True)
-
             def added(ctx, d):
                 if d.get_driver() == 'syna_00a2':
                     seen.setdefault('added', d)
-            context.connect('device-removed', removed)
+            # The reader re-enumerates on resume. An open device emits its own
+            # "removed"; the context only reports it once the device is closed,
+            # which is what fprintd does next
+            dev.connect('removed', lambda d: seen.setdefault('removed', True))
             context.connect('device-added', added)
             event('waiting_for_suspend', hint='suspend the laptop now, then resume it')
             wait(lambda: 'removed' in seen, 'device removal (suspend/resume)', seconds=600)
             event('device_removed')
-            wait(lambda: 'added' in seen, 'device re-adding', seconds=120)
-            event('device_added')
             close_device(dev)
+            wait(lambda: 'added' in seen, 'the new device', seconds=120)
+            event('device_added')
             dev = state['dev'] = seen['added']
             watch(dev)
             open_device(dev)

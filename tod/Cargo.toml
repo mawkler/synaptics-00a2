@@ -16,6 +16,7 @@ doctest = false
 
 [dependencies]
 anyhow = "1"
+serde_json = "1"
 syna-00a2 = { path = ".." }
 
 [build-dependencies]

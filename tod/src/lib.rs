@@ -7,6 +7,7 @@
 use std::{
     ffi::{c_char, c_int, c_void, CString},
     fs,
+    io::Write,
     panic::{catch_unwind, AssertUnwindSafe},
     ptr, slice,
     time::Duration,
@@ -158,12 +159,13 @@ pub unsafe extern "C" fn syna_capture(
         // SAFETY: the C side passes the handle from syna_open, used by one thread at a time
         let handle = unsafe { handle.as_mut() }.context("the device is not open")?;
         let cancelled = || is_cancelled(user) != 0;
-        let (result, _, _) = handle.scanner.capture(
+        let (result, events, stale) = handle.scanner.capture(
             FINGER_TIMEOUT,
             &cancelled,
             || on_status(user, SYNA_STATUS_NEEDED),
             || on_status(user, SYNA_STATUS_PRESENT),
         );
+        trace(&result, &events, &stale);
         match result {
             Ok(Scan::Image(scan)) => {
                 ensure!(
@@ -182,6 +184,24 @@ pub unsafe extern "C" fn syna_capture(
             Err(e) => Err(e),
         }
     })
+}
+
+/// Appends one JSON line per scan to the file named by SYNA_00A2_TRACE, for
+/// diagnosing scans that stall. Off unless the variable is set (tests only).
+fn trace(result: &Result<Scan>, events: &[syna_00a2::capture::Event], stale: &[String]) {
+    let Some(path) = std::env::var_os("SYNA_00A2_TRACE") else {
+        return;
+    };
+    let outcome = match result {
+        Ok(Scan::Image(_)) => "image".to_owned(),
+        Ok(Scan::Rejected(code)) => format!("rejected {code:#x}"),
+        Err(e) => format!("error: {e:#}"),
+    };
+    let line = serde_json::json!({ "outcome": outcome, "events": events, "stale": stale });
+    let file = fs::OpenOptions::new().create(true).append(true).open(path);
+    if let Ok(mut file) = file {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 /// Encodes `count` images of `syna_image_size()` pixels as a template. The

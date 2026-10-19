@@ -728,6 +728,7 @@ dependencies = [
  "anyhow",
  "cc",
  "pkg-config",
+ "serde_json",
  "syna-00a2",
 ]
 
