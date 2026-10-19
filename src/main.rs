@@ -17,7 +17,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use syna_00a2::{blobs, calibrate, capture, db, device, matcher, pairing, proto, tables, usb};
+use syna_00a2::{blobs, calibrate, capture, db, device, matcher, moh, pairing, proto, tables, usb};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -161,6 +161,20 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Offline: builds a template envelope for chip-enroll from enroll-mode
+    /// images. Uses the four largest keypoint pools, in capture order. Prints
+    /// the pools, the frames used and the envelope's SHA-256.
+    ChipTemplate {
+        /// 112×112 PGMs, in capture order
+        #[arg(long, num_args = 1.., required = true)]
+        images: Vec<PathBuf>,
+        /// Finger subtype for the record header, e.g. 0xf5
+        #[arg(long, value_parser = parse_u16)]
+        subtype: u16,
+        /// Where to write the envelope (mode 0600)
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Offline: scores probe images against a template built from enrolled
     /// images, as the driver's matcher does. Prints scores only.
     Score {
@@ -220,6 +234,11 @@ fn main() -> Result<()> {
             probe,
             prepare,
         } => score(&enroll, &probe, &prepare),
+        Command::ChipTemplate {
+            images,
+            subtype,
+            out,
+        } => chip_template(&images, subtype, &out),
         Command::ChipIdentify {
             serial_file,
             attempts,
@@ -267,8 +286,9 @@ fn main() -> Result<()> {
                 "--confirm does not match the envelope's SHA-256 {hash}; nothing was sent"
             );
             ensure!(
-                envelope.len() == MOH_ENVELOPE_SIZE,
-                "a MoH envelope is {MOH_ENVELOPE_SIZE} bytes, not {}",
+                envelope.len() == moh::ENVELOPE_SIZE,
+                "a MoH envelope is {} bytes, not {}",
+                moh::ENVELOPE_SIZE,
                 envelope.len()
             );
             with_sensor(&serial_file, output, |sensor, keys, steps| {
@@ -607,11 +627,6 @@ fn run_db(
     Ok(())
 }
 
-/// Size of python-validity's (and the DLL's) MoH template envelope
-const MOH_ENVELOPE_SIZE: usize = 23136;
-/// Record type python-validity stores MoH fingers as
-const MOH_FINGER_KIND: u16 = 6;
-
 fn run_chip_enroll(
     sensor: usb::Sensor,
     keys: &pairing::HostKeys,
@@ -655,7 +670,7 @@ fn run_chip_enroll(
     session
         .cmd_ok(&sensor, &blobs::DB_WRITE_ENABLE)
         .context("db_write_enable; nothing was written")?;
-    let request = db::new_record_request(parent, MOH_FINGER_KIND, storage.dbid, envelope, &[0]);
+    let request = db::new_record_request(parent, moh::FINGER_KIND, storage.dbid, envelope, &[0]);
     let stored = session.cmd(&sensor, &request);
     let commit = session.cmd(&sensor, &db::COMMIT_REQUEST);
     let stored = stored?;
@@ -974,6 +989,46 @@ fn score(enroll: &[PathBuf], probes: &[PathBuf], prepare: &str) -> Result<()> {
         matcher::THRESHOLD
     );
     Ok(())
+}
+
+fn chip_template(images: &[PathBuf], subtype: u16, out: &Path) -> Result<()> {
+    let frames = images
+        .iter()
+        .map(|p| moh::extract(&read_pgm(p)?))
+        .collect::<Result<Vec<_>>>()?;
+    let envelope = moh::template(&frames, subtype);
+    write_private(out, &envelope)?;
+    let name = |p: &PathBuf| {
+        p.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let used: Vec<_> = moh::choose(&frames)
+        .into_iter()
+        .map(|k| name(&images[k]))
+        .collect();
+    let pools: Vec<_> = frames.iter().map(|f| f.pool).collect();
+    let weak = pools.iter().filter(|&&n| n < moh::FRAME_KP_CAP).count();
+    report(
+        &json!({
+            "pools": pools,
+            "weak_frames": weak,
+            "used": used,
+            "subtype": format!("{subtype:#06x}"),
+            "bytes": envelope.len(),
+            "sha256": hex(&Sha256::digest(&envelope)),
+        }),
+        None,
+    )
+}
+
+fn parse_u16(s: &str) -> Result<u16, String> {
+    match s.strip_prefix("0x") {
+        Some(digits) => u16::from_str_radix(digits, 16),
+        None => s.parse(),
+    }
+    .map_err(|e| e.to_string())
 }
 
 /// Pixels of a 112×112 8-bit binary PGM as written by `pgm`

@@ -7,6 +7,7 @@ pub mod capture;
 pub mod db;
 pub mod device;
 pub mod matcher;
+pub mod moh;
 pub mod pairing;
 pub mod prog;
 pub mod proto;
