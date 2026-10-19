@@ -705,14 +705,10 @@ fn run_chip_enroll(
 
 /// How long the chip may take to report a match decision
 const MATCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// A finger seen this soon after an identify scan starts was already down
-/// (step 2c: 52 ms for held touches, at least 536 ms for new ones)
-const HELD_FINGER_MS: u128 = 150;
-const MAX_HELD: usize = 100;
 /// Identify-mode scans finish about 0.1 s after the touch without waiting for
 /// a lift, so the next scan would catch the same touch again (step 2a: 3
-/// touches gave 6 decisions). Waiting this long between attempts lets the
-/// finger come off first.
+/// touches gave 6 decisions). The scanner discards those; waiting this long
+/// between attempts lets the finger come off first.
 const IDENTIFY_PAUSE: Duration = Duration::from_millis(1500);
 
 fn run_chip_identify(
@@ -755,11 +751,17 @@ fn run_chip_identify(
     );
 
     let is_cancelled = || cancelled.load(Ordering::Relaxed);
-    let (mut results, mut rejected, mut held) = (Vec::new(), 0, 0);
+    let (mut results, mut rejected) = (Vec::new(), 0);
     let mut failure = None;
     while results.len() < attempts {
         let attempt = results.len() + 1;
-        let (scan, events, stale) = scanner.scan(
+        let device::ScanOutcome {
+            result,
+            events,
+            stale,
+            held,
+            stalled,
+        } = scanner.scan(
             calibrate::Mode::Identify,
             finger_timeout,
             &is_cancelled,
@@ -769,12 +771,12 @@ fn run_chip_identify(
             },
             || {},
         );
-        match scan {
+        match result {
             Ok(capture::Scan::Rejected(code)) => {
                 rejected += 1;
                 steps.insert(
                     format!("rejected_{rejected}"),
-                    json!({ "code": format!("{code:#x}"), "events": events }),
+                    json!({ "code": format!("{code:#x}"), "events": events, "held": held, "stalled": stalled }),
                 );
                 if rejected > MAX_REJECTED {
                     failure = Some(anyhow::anyhow!("{rejected} placements rejected"));
@@ -782,21 +784,6 @@ fn run_chip_identify(
                 }
             }
             Ok(capture::Scan::Image(image)) => {
-                // A finger already down when the scan started is the previous
-                // touch, still held: don't count it, try again shortly
-                let finger_ms = events
-                    .iter()
-                    .find(|e| e.bytes.starts_with("02"))
-                    .map(|e| e.ms);
-                if attempt > 1 && finger_ms.is_some_and(|ms| ms < HELD_FINGER_MS) {
-                    held += 1;
-                    ensure!(
-                        held <= MAX_HELD,
-                        "the finger stayed on the sensor for too long"
-                    );
-                    std::thread::sleep(Duration::from_millis(300));
-                    continue;
-                }
                 if let (Some((dir, label)), false) = (save, image.pixels.is_empty()) {
                     write_private(
                         &dir.join(format!("{label}-{attempt:02}.pgm")),
@@ -804,7 +791,7 @@ fn run_chip_identify(
                     )?;
                 }
                 let decision = chip_match(&mut scanner);
-                let mut entry = json!({ "attempt": attempt, "result_pixels": image.pixels.len(), "stale_events": stale, "events": events });
+                let mut entry = json!({ "attempt": attempt, "result_pixels": image.pixels.len(), "stale_events": stale, "events": events, "held": held, "stalled": stalled });
                 match decision {
                     Ok(decision) => entry["match"] = decision,
                     Err(e) => {
@@ -820,7 +807,7 @@ fn run_chip_identify(
             }
             Err(e) => {
                 results.push(
-                    json!({ "attempt": attempt, "error": format!("{e:#}"), "events": events }),
+                    json!({ "attempt": attempt, "error": format!("{e:#}"), "events": events, "held": held, "stalled": stalled }),
                 );
                 failure = Some(e);
                 break;
@@ -902,7 +889,13 @@ fn run_capture(
     let (mut saved, mut rejected) = (0, 0);
     while saved < names.len() {
         let name = &names[saved];
-        let (result, events, stale) = scanner.capture(
+        let device::ScanOutcome {
+            result,
+            events,
+            stale,
+            stalled,
+            ..
+        } = scanner.capture(
             finger_timeout,
             &is_cancelled,
             || {
@@ -917,7 +910,7 @@ fn run_capture(
         );
         match result {
             Ok(capture::Scan::Rejected(code)) => {
-                captures.push(json!({ "stale_events": stale, "events": events, "rejected": format!("{code:#x}") }));
+                captures.push(json!({ "stale_events": stale, "events": events, "stalled": stalled, "rejected": format!("{code:#x}") }));
                 rejected += 1;
                 if rejected > MAX_REJECTED {
                     failure = Some(anyhow::anyhow!(
@@ -939,11 +932,12 @@ fn run_capture(
                     "pixels": device::pixel_stats(&image.pixels),
                     "stale_events": stale,
                     "events": events,
+                    "stalled": stalled,
                 }));
             }
             Err(e) => {
                 captures.push(
-                    json!({ "stale_events": stale, "events": events, "error": format!("{e:#}") }),
+                    json!({ "stale_events": stale, "events": events, "stalled": stalled, "error": format!("{e:#}") }),
                 );
                 failure = Some(e.context(format!("after {saved} of {} captures", names.len())));
                 break;

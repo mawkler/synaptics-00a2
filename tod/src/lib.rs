@@ -16,7 +16,7 @@ use std::{
 use anyhow::{ensure, Context, Result};
 use syna_00a2::{
     capture::Scan,
-    device::{self, Scanner},
+    device::{self, ScanOutcome, Scanner},
     matcher::{self, Matcher, Template},
     pairing::HostKeys,
     usb,
@@ -159,14 +159,14 @@ pub unsafe extern "C" fn syna_capture(
         // SAFETY: the C side passes the handle from syna_open, used by one thread at a time
         let handle = unsafe { handle.as_mut() }.context("the device is not open")?;
         let cancelled = || is_cancelled(user) != 0;
-        let (result, events, stale) = handle.scanner.capture(
+        let outcome = handle.scanner.capture(
             FINGER_TIMEOUT,
             &cancelled,
             || on_status(user, SYNA_STATUS_NEEDED),
             || on_status(user, SYNA_STATUS_PRESENT),
         );
-        trace(&result, &events, &stale);
-        match result {
+        trace(&outcome);
+        match outcome.result {
             Ok(Scan::Image(scan)) => {
                 ensure!(
                     scan.pixels.len() == syna_image_size(),
@@ -188,16 +188,21 @@ pub unsafe extern "C" fn syna_capture(
 
 /// Appends one JSON line per scan to the file named by SYNA_00A2_TRACE, for
 /// diagnosing scans that stall. Off unless the variable is set (tests only).
-fn trace(result: &Result<Scan>, events: &[syna_00a2::capture::Event], stale: &[String]) {
+fn trace(scan: &ScanOutcome) {
     let Some(path) = std::env::var_os("SYNA_00A2_TRACE") else {
         return;
     };
-    let outcome = match result {
+    let outcome = match &scan.result {
         Ok(Scan::Image(_)) => "image".to_owned(),
         Ok(Scan::Rejected(code)) => format!("rejected {code:#x}"),
         Err(e) => format!("error: {e:#}"),
     };
-    let line = serde_json::json!({ "outcome": outcome, "events": events, "stale": stale });
+    let line = serde_json::json!({
+        "outcome": outcome,
+        "events": scan.events,
+        "stale": scan.stale,
+        "stalled": scan.stalled,
+    });
     let file = fs::OpenOptions::new().create(true).append(true).open(path);
     if let Ok(mut file) = file {
         let _ = writeln!(file, "{line}");

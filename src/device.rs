@@ -6,13 +6,13 @@
 
 use std::{fs, thread::sleep, time::Duration};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
     blobs, calibrate,
-    capture::{Capture, Scan},
+    capture::{Capture, Event, Scan, Stalled},
     pairing::{self, HostKeys},
     proto, tables, tls, usb,
 };
@@ -32,6 +32,13 @@ const BUSY_WAIT: Duration = Duration::from_millis(500);
 pub const MAX_BLANK_DIFF: f64 = 6.0;
 const CALIBRATION_ATTEMPTS: usize = 3;
 const CALIBRATION_RETRY_WAIT: Duration = Duration::from_secs(1);
+
+/// Identify scans of a finger still down from the previous touch, discarded
+/// before giving up. Each takes about 0.4 s with the wait.
+const MAX_HELD: usize = 100;
+const HELD_RESCAN_WAIT: Duration = Duration::from_millis(300);
+/// Pause between the capture stop that ends a stalled scan and the restart
+const STALL_RESTART_WAIT: Duration = Duration::from_millis(500);
 
 /// This host's DMI product name, which is world-readable in sysfs
 pub fn dmi_product_name() -> Result<String> {
@@ -255,6 +262,23 @@ pub struct Scanner {
     pub session: tls::Session,
     enroll: Vec<u8>,
     identify: Vec<u8>,
+    /// An identify scan finishes without waiting for the lift, so its finger
+    /// may still be down when the next scan starts
+    finger_may_be_down: bool,
+}
+
+/// What [`Scanner::scan`] did
+pub struct ScanOutcome {
+    pub result: Result<Scan>,
+    /// The events of every scan run, in order; each scan's start with its `00`
+    pub events: Vec<Event>,
+    /// Events left over from before the first scan
+    pub stale: Vec<String>,
+    /// Identify scans discarded because the finger was still down from the
+    /// previous touch
+    pub held: usize,
+    /// Scans restarted because they stalled after the touch
+    pub stalled: usize,
 }
 
 impl Scanner {
@@ -284,6 +308,7 @@ impl Scanner {
                     session,
                     enroll,
                     identify,
+                    finger_may_be_down: false,
                 });
             }
             log(
@@ -298,14 +323,14 @@ impl Scanner {
         )
     }
 
-    /// One enroll-mode scan; see [`Capture::scan`]. Also returns the scan's events.
+    /// One enroll-mode scan; see [`Scanner::scan`]
     pub fn capture(
         &mut self,
         finger_timeout: Duration,
         cancelled: &dyn Fn() -> bool,
-        on_ready: impl FnOnce(),
-        on_finger: impl FnOnce(),
-    ) -> (Result<Scan>, Vec<crate::capture::Event>, Vec<String>) {
+        on_ready: impl FnMut(),
+        on_finger: impl FnMut(),
+    ) -> ScanOutcome {
         self.scan(
             calibrate::Mode::Enroll,
             finger_timeout,
@@ -315,27 +340,85 @@ impl Scanner {
         )
     }
 
-    /// One scan in the given mode (enroll, or identify for on-chip matching)
+    /// One touch in the given mode (enroll, or identify for on-chip
+    /// matching); see [`Capture::scan`]. `on_ready` runs whenever the sensor
+    /// waits for a new touch, `on_finger` when one is down.
+    ///
+    /// Identify scans of a finger still down from the previous touch are
+    /// discarded and rescanned until a new touch comes. A scan that stalls
+    /// after the touch is stopped and restarted once.
     pub fn scan(
         &mut self,
         mode: calibrate::Mode,
         finger_timeout: Duration,
         cancelled: &dyn Fn() -> bool,
-        on_ready: impl FnOnce(),
-        on_finger: impl FnOnce(),
-    ) -> (Result<Scan>, Vec<crate::capture::Event>, Vec<String>) {
-        let mut capture = Capture::new(&mut self.session, &self.sensor, cancelled);
-        let stale = match capture.drain() {
-            Ok(stale) => stale,
-            Err(e) => return (Err(e), Vec::new(), Vec::new()),
+        mut on_ready: impl FnMut(),
+        mut on_finger: impl FnMut(),
+    ) -> ScanOutcome {
+        let mut out = ScanOutcome {
+            result: Err(anyhow!("no scan ran")),
+            events: Vec::new(),
+            stale: Vec::new(),
+            held: 0,
+            stalled: 0,
         };
+        let mut capture = Capture::new(&mut self.session, &self.sensor, cancelled);
+        match capture.drain() {
+            Ok(stale) => out.stale = stale,
+            Err(e) => {
+                out.result = Err(e);
+                return out;
+            }
+        }
         let command = if mode == calibrate::Mode::Identify {
             &self.identify
         } else {
             &self.enroll
         };
-        let result = capture.scan(command, finger_timeout, on_ready, on_finger);
-        (result, std::mem::take(&mut capture.events), stale)
+        let mut waiting = false;
+        loop {
+            let check_held = mode == calibrate::Mode::Identify && self.finger_may_be_down;
+            // A held rescan continues the same wait for a touch
+            let mut ready = || {
+                if !waiting {
+                    waiting = true;
+                    on_ready();
+                }
+            };
+            let result = capture.scan(
+                command,
+                finger_timeout,
+                check_held,
+                &mut ready,
+                &mut on_finger,
+            );
+            out.events.append(&mut capture.events);
+            match result {
+                Err(e) if e.is::<Stalled>() && out.stalled == 0 => {
+                    // The touch was lost: the restarted scan takes any finger
+                    out.stalled += 1;
+                    self.finger_may_be_down = false;
+                    waiting = false;
+                    sleep(STALL_RESTART_WAIT);
+                }
+                Ok(_) if capture.held => {
+                    out.held += 1;
+                    if out.held > MAX_HELD {
+                        out.result = Err(anyhow!("the finger stayed on the sensor for too long"));
+                        return out;
+                    }
+                    sleep(HELD_RESCAN_WAIT);
+                }
+                result => {
+                    if result.is_ok() {
+                        // Enroll scans end on the lift
+                        self.finger_may_be_down = mode == calibrate::Mode::Identify;
+                    }
+                    out.result = result;
+                    return out;
+                }
+            }
+        }
     }
 }
 
