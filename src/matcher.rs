@@ -16,12 +16,81 @@ const N: usize = 2 * SIDE;
 const MIN_OVERLAP: f64 = 0.35;
 const ROTATIONS: std::ops::RangeInclusive<i32> = -6..=6;
 const ROTATION_STEP_DEG: f64 = 5.0;
-/// Accept at or above this score. M5b, 10 enrolled images: genuine ≥ 0.514
-/// (18 attempts over 2 sessions), impostor ≤ 0.323 (35 attempts, 5 fingers),
-/// ≤ 0.401 in a set-vs-set check.
-pub const THRESHOLD: f64 = 0.46;
+/// Accept at or above this score (with [`PREPARE`]). Cross-session evaluation
+/// on 2026-10-19, galleries of 5–10 images from one session: genuine ≥ 0.361
+/// (71 attempts of one finger over two days, 65 at or above 0.42), impostor
+/// ≤ 0.367 (633 attempts, 7 fingers, 99th percentile 0.347).
+pub const THRESHOLD: f64 = 0.42;
 
 type Spectrum = Vec<Complex<f64>>;
+
+/// How images are prepared before correlation, mirroring the variants
+/// evaluated on 2026-10-19 (cross-session scores fell with raw images)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Prepare {
+    Raw,
+    /// A `smooth`×`smooth` box blur, then local contrast normalisation over a
+    /// `window`×`window` box: zero mean and unit variance, mapped to 128 ± 48
+    /// and clipped to 0..255
+    Normalise {
+        smooth: usize,
+        window: usize,
+    },
+}
+
+/// Best worst-case cross-session gap for single-session templates (+0.06,
+/// against −0.04 raw), and the lowest impostor scores of the variants tried
+pub const PREPARE: Prepare = Prepare::Normalise {
+    smooth: 3,
+    window: 21,
+};
+
+/// Mean over a k×k window (k odd), with numpy's "reflect" padding (the edge
+/// pixel is not repeated)
+fn box_mean(image: &[f64], k: usize) -> Vec<f64> {
+    let half = (k / 2) as isize;
+    let last = SIDE as isize - 1;
+    let reflect = |i: isize| -> usize {
+        let i = if i < 0 { -i } else { i };
+        (if i > last { 2 * last - i } else { i }) as usize
+    };
+    // Separable: rows, then columns
+    let mut rows = vec![0.0; SIDE * SIDE];
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let sum: f64 = (-half..=half)
+                .map(|d| image[y * SIDE + reflect(x as isize + d)])
+                .sum();
+            rows[y * SIDE + x] = sum;
+        }
+    }
+    let mut out = vec![0.0; SIDE * SIDE];
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let sum: f64 = (-half..=half)
+                .map(|d| rows[reflect(y as isize + d) * SIDE + x])
+                .sum();
+            out[y * SIDE + x] = sum / (k * k) as f64;
+        }
+    }
+    out
+}
+
+pub fn prepare(image: &[f64], how: Prepare) -> Vec<f64> {
+    let Prepare::Normalise { smooth, window } = how else {
+        return image.to_vec();
+    };
+    let image = box_mean(image, smooth);
+    let squared: Vec<f64> = image.iter().map(|v| v * v).collect();
+    let (mean, mean_sq) = (box_mean(&image, window), box_mean(&squared, window));
+    image
+        .iter()
+        .zip(mean.iter().zip(&mean_sq))
+        .map(|(v, (m, m2))| {
+            (128.0 + 48.0 * (v - m) / (m2 - m * m).max(1e-6).sqrt()).clamp(0.0, 255.0)
+        })
+        .collect()
+}
 
 struct Fft2 {
     forward: Arc<dyn Fft<f64>>,
@@ -142,6 +211,7 @@ impl Template {
 
 /// Per-template state: the spectra of each enrolled image and its square
 pub struct Matcher {
+    prepare: Prepare,
     fft: Fft2,
     /// Spectrum of an all-ones mask (enrolled images are fully valid)
     full_mask: Spectrum,
@@ -150,18 +220,24 @@ pub struct Matcher {
 
 impl Matcher {
     pub fn new(template: &Template) -> Self {
+        Self::with(template, PREPARE)
+    }
+
+    pub fn with(template: &Template, how: Prepare) -> Self {
         let fft = Fft2::new();
         let full_mask = fft.spectrum(&vec![1.0; SIDE * SIDE]);
         let gallery = template
             .images
             .iter()
             .map(|image| {
-                let b: Vec<f64> = image.iter().map(|&p| p as f64).collect();
+                let raw: Vec<f64> = image.iter().map(|&p| p as f64).collect();
+                let b = prepare(&raw, how);
                 let b2: Vec<f64> = b.iter().map(|v| v * v).collect();
                 (fft.spectrum(&b), fft.spectrum(&b2))
             })
             .collect();
         Self {
+            prepare: how,
             fft,
             full_mask,
             gallery,
@@ -171,7 +247,8 @@ impl Matcher {
     /// Best masked NCC of `probe` (SIDE×SIDE pixels) over rotations, shifts
     /// and enrolled images; -1 if nothing overlaps enough
     pub fn score(&self, probe: &[u8]) -> f64 {
-        let probe: Vec<f64> = probe.iter().map(|&p| p as f64).collect();
+        let raw: Vec<f64> = probe.iter().map(|&p| p as f64).collect();
+        let probe = prepare(&raw, self.prepare);
         let steps: Vec<i32> = ROTATIONS.collect();
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
@@ -239,6 +316,11 @@ impl Matcher {
 mod tests {
     use super::*;
 
+    /// The tests below predate `Prepare`; their expected values are for raw images
+    fn raw(template: &Template) -> Matcher {
+        Matcher::with(template, Prepare::Raw)
+    }
+
     // Expected values from tools/corr_check.py on the same synthetic images
 
     fn synth(seed: usize) -> Vec<f64> {
@@ -285,13 +367,13 @@ mod tests {
         let template = Template {
             images: vec![bytes(&g1), bytes(&g0)],
         };
-        let matcher = Matcher::new(&template);
+        let matcher = raw(&template);
         assert_close(
             matcher.score(&bytes(&shifted(&g0, 9, -6, 5))),
             1.0000000000000013,
         );
         assert_close(
-            Matcher::new(&Template {
+            raw(&Template {
                 images: vec![bytes(&g0), bytes(&g1)],
             })
             .score(&bytes(&synth(7))),
@@ -318,18 +400,61 @@ mod tests {
     #[test]
     fn single_rotation_matches_corr_check() {
         let (g0, g1) = (synth(1), synth(2));
-        let matcher = Matcher::new(&Template {
+        let matcher = raw(&Template {
             images: vec![bytes(&g1)],
         });
         let (image, mask) = rotate(&shifted(&g0, 9, -6, 5), 10.0);
         assert_close(matcher.score_rotated(&image, &mask), 0.062054707113663385);
-        let self_matcher = Matcher::new(&Template {
+        let self_matcher = raw(&Template {
             images: vec![bytes(&g0)],
         });
         assert_close(
             self_matcher.score_rotated(&g0, &vec![1.0; SIDE * SIDE]),
             1.0000000000000013,
         );
+    }
+
+    #[test]
+    fn prepare_matches_the_python_variants() {
+        let g0 = synth(1);
+        let k15 = prepare(
+            &g0,
+            Prepare::Normalise {
+                smooth: 3,
+                window: 15,
+            },
+        );
+        assert!((k15.iter().sum::<f64>() - 1606009.4402667657).abs() < 1e-6);
+        for (ours, theirs) in k15[..4].iter().zip([
+            0.0,
+            0.5624624754406113,
+            41.89375882595071,
+            108.55068355476556,
+        ]) {
+            assert_close(*ours, theirs);
+        }
+        assert_close(k15[SIDE * SIDE - 1], 49.94985297000002);
+        let k21 = prepare(
+            &g0,
+            Prepare::Normalise {
+                smooth: 3,
+                window: 21,
+            },
+        );
+        assert!((k21.iter().sum::<f64>() - 1605875.0858124434).abs() < 1e-6);
+        assert_eq!(prepare(&g0, Prepare::Raw), g0);
+
+        let template = Template {
+            images: vec![bytes(&synth(1)), bytes(&synth(2))],
+        };
+        let matcher = Matcher::with(
+            &template,
+            Prepare::Normalise {
+                smooth: 3,
+                window: 15,
+            },
+        );
+        assert_close(matcher.score(&bytes(&synth(7))), 0.12662702047552413);
     }
 
     #[test]

@@ -109,6 +109,9 @@ enum Command {
         /// 112×112 PGMs to score
         #[arg(long, num_args = 1.., required = true)]
         probe: Vec<PathBuf>,
+        /// Image preparation: "default", "raw", or "SMOOTHxWINDOW" (e.g. 3x15)
+        #[arg(long, default_value = "default")]
+        prepare: String,
     },
 }
 
@@ -151,7 +154,11 @@ fn main() -> Result<()> {
         } => with_sensor(&serial_file, output, |sensor, keys, steps| {
             run_calibrate(sensor, keys, steps, &out_dir)
         }),
-        Command::Score { enroll, probe } => score(&enroll, &probe),
+        Command::Score {
+            enroll,
+            probe,
+            prepare,
+        } => score(&enroll, &probe, &prepare),
         Command::Capture {
             serial_file,
             out_dir,
@@ -464,12 +471,25 @@ fn run_capture(
     failure.map_or(Ok(()), Err)
 }
 
-fn score(enroll: &[PathBuf], probes: &[PathBuf]) -> Result<()> {
+fn score(enroll: &[PathBuf], probes: &[PathBuf], prepare: &str) -> Result<()> {
+    let how = match prepare {
+        "default" => matcher::PREPARE,
+        "raw" => matcher::Prepare::Raw,
+        spec => {
+            let (smooth, window) = spec
+                .split_once('x')
+                .context("--prepare SMOOTHxWINDOW, e.g. 3x15")?;
+            matcher::Prepare::Normalise {
+                smooth: smooth.parse()?,
+                window: window.parse()?,
+            }
+        }
+    };
     let template = matcher::Template {
         images: enroll.iter().map(|p| read_pgm(p)).collect::<Result<_>>()?,
     };
     let started = std::time::Instant::now();
-    let matcher = matcher::Matcher::new(&template);
+    let matcher = matcher::Matcher::with(&template, how);
     for path in probes {
         let score = matcher.score(&read_pgm(path)?);
         println!(
