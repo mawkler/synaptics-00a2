@@ -723,14 +723,21 @@ pub fn template(frames: &[Frame], subtype: u16) -> Vec<u8> {
 /// [`template`], with the section poses estimated from the frames and the
 /// placements chosen so that all of them register (see
 /// [`crate::pose::choose_registered`]). Returns the envelope and the frame
-/// indices used, or None when no four placements register.
-pub fn template_with_poses(frames: &[Frame], subtype: u16) -> Option<(Vec<u8>, Vec<usize>)> {
+/// indices used, or None when no four placements register. With
+/// `write_poses` false the header keeps python-validity's near-identity (the
+/// control for the same placements).
+pub fn template_with_poses(
+    frames: &[Frame],
+    subtype: u16,
+    write_poses: bool,
+) -> Option<(Vec<u8>, Vec<usize>)> {
     let (used, poses) = choose_registered(frames)?;
     let sections: Vec<&[Keypoint]> = used
         .iter()
         .map(|&k| frames[k].keypoints.as_slice())
         .collect();
-    Some((assemble_with(&sections, subtype, Some(&poses)), used))
+    let header = write_poses.then_some(poses.as_slice());
+    Some((assemble_with(&sections, subtype, header), used))
 }
 
 #[cfg(test)]

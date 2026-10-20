@@ -242,6 +242,46 @@ pub fn new_record_request(
     request
 }
 
+/// Record type of a user under a storage
+pub const USER_KIND: u16 = 5;
+/// Sub-authorities every Linux-owned user's SID starts with (see
+/// `docs/on-chip-driver.md`); the Linux uid follows
+pub const LINUX_SID_PREFIX: [u32; 4] = [21, 111_111_111, 1_111_111_111, 1_111_111_111];
+
+/// The identity value of a user record, as python-validity's
+/// `identity_to_bytes(SidIdentity(1, 5, LINUX_SID_PREFIX + [uid]))`: type 3,
+/// the SID's length, the SID (revision 1, authority 5), zero-padded to 0x4c
+/// bytes because the chip treats the same SID at different sizes as different
+/// keys
+pub fn linux_identity(uid: u32) -> Vec<u8> {
+    let sub: Vec<u32> = LINUX_SID_PREFIX.iter().copied().chain([uid]).collect();
+    let mut sid = vec![1, sub.len() as u8, 0, 0, 0, 0, 0, 5];
+    for s in sub {
+        sid.extend(s.to_le_bytes());
+    }
+    let mut value = Vec::from(3u32.to_le_bytes());
+    value.extend((sid.len() as u32).to_le_bytes());
+    value.extend(sid);
+    value.resize(0x4c, 0);
+    value
+}
+
+/// `0x4a` by identity: `<BHHH`, 0, the storage's dbid, the identity's size,
+/// then the identity. Status 0x04b3 (not found) when no user has it.
+pub fn user_by_identity_request(storage: u16, identity: &[u8]) -> Vec<u8> {
+    let mut request = vec![0x4a, 0, 0];
+    request.extend(storage.to_le_bytes());
+    request.extend((identity.len() as u16).to_le_bytes());
+    request.extend(identity);
+    request
+}
+
+/// `0x47` for a new user record under the user storage: parent and storage
+/// are both the storage's dbid, no trailer
+pub fn new_user_request(storage: u16, identity: &[u8]) -> Vec<u8> {
+    new_record_request(storage, USER_KIND, storage, identity, &[])
+}
+
 /// `0x1a` (python-validity's `call_cleanups`), sent after every write
 pub const COMMIT_REQUEST: [u8; 1] = [0x1a];
 /// `0x1a` status when there is nothing to commit, which is not an error
@@ -336,6 +376,25 @@ mod tests {
         assert_eq!(
             new_record_request(5, 6, 3, &[1, 2, 3, 4], &[0]),
             unhex("47 0500 0600 0300 0400 01020304 00")
+        );
+    }
+
+    #[test]
+    fn linux_identity_matches_python_validity() {
+        // identity_to_bytes(sid_from_string("S-1-5-21-111111111-1111111111-1111111111-90001"))
+        let want = unhex(
+            "030000001c000000010500000000000515000000c76b9f06c7353a42c7353a42915f0100\
+             00000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        );
+        assert_eq!(want.len(), 0x4c);
+        assert_eq!(linux_identity(90001), want);
+        assert_ne!(linux_identity(90001), linux_identity(90002));
+        let request = new_user_request(3, &want);
+        assert_eq!(request[..9], unhex("47 0300 0500 0300 4c00")[..9]);
+        assert_eq!(request.len(), 9 + 0x4c);
+        assert_eq!(
+            user_by_identity_request(3, &want)[..7],
+            unhex("4a 00 00 0300 4c00")[..7]
         );
     }
 

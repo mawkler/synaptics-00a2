@@ -133,8 +133,8 @@ enum Command {
         /// Restrict the chip's match to this user record id (0 = every user,
         /// as python-validity). Experimental: whether the chip honours it is
         /// being tested.
-        #[arg(long, default_value_t = 0)]
-        match_user: u16,
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        match_user: Vec<u16>,
         /// Also save each scanned image here as LABEL-NN.pgm (mode 0600)
         #[arg(long)]
         save_dir: Option<PathBuf>,
@@ -167,6 +167,28 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// DATABASE WRITE. Creates one user record for a Linux uid under the
+    /// StgWindsor user storage (python-validity's `new_user`): the
+    /// db_write_enable blob, then 0x47, then 0x1a. Refuses if a user with that
+    /// SID exists. `--dry-run` prints the exact request and its SHA-256 without
+    /// opening the sensor. A real run needs `--confirm` to equal that SHA-256.
+    ChipNewUser {
+        /// File holding the DMI product serial (root-only in sysfs)
+        #[arg(long)]
+        serial_file: Option<PathBuf>,
+        /// Linux uid: the last sub-authority of the user's SID
+        #[arg(long)]
+        uid: u32,
+        /// Print the request and its SHA-256, send nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// The request's SHA-256, as shown by --dry-run and approved
+        #[arg(long)]
+        confirm: Option<String>,
+        /// Also write the JSON report here (mode 0600)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Offline: builds a template envelope for chip-enroll from enroll-mode
     /// images. Uses the four largest keypoint pools, in capture order. Prints
     /// the pools, the frames used and the envelope's SHA-256.
@@ -184,6 +206,10 @@ enum Command {
         /// near-identity. Fails if the four placements don't register.
         #[arg(long)]
         poses: bool,
+        /// With --poses: pick the same registered placements but keep the
+        /// near-identity header (the control for --poses)
+        #[arg(long, requires = "poses")]
+        identity_header: bool,
     },
     /// Offline: scores probe images against a template built from enrolled
     /// images, as the driver's matcher does. Prints scores only.
@@ -249,7 +275,8 @@ fn main() -> Result<()> {
             subtype,
             out,
             poses,
-        } => chip_template(&images, subtype, &out, poses),
+            identity_header,
+        } => chip_template(&images, subtype, &out, poses, identity_header),
         Command::ChipIdentify {
             serial_file,
             attempts,
@@ -279,11 +306,46 @@ fn main() -> Result<()> {
                     &IdentifyPlan {
                         attempts,
                         finger_timeout: timeout,
-                        match_user,
+                        match_users: match_user,
                     },
                     &cancelled,
                     save.as_ref(),
                 )
+            })
+        }
+        Command::ChipNewUser {
+            serial_file,
+            uid,
+            dry_run,
+            confirm,
+            output,
+        } => {
+            // The storage's dbid is read from the sensor; the request shown by
+            // --dry-run uses the one this database has (3), which the real run
+            // checks again
+            let identity = db::linux_identity(uid);
+            let request = db::new_user_request(NEW_USER_STORAGE_DBID, &identity);
+            let hash = hex(&Sha256::digest(&request));
+            if dry_run {
+                return report(
+                    &json!({
+                        "uid": uid,
+                        "sid": format!("S-1-5-{}-{uid}", db::LINUX_SID_PREFIX.map(|s| s.to_string()).join("-")),
+                        "storage_dbid": NEW_USER_STORAGE_DBID,
+                        "request_bytes": request.len(),
+                        "request": hex(&request),
+                        "request_sha256": hash,
+                    }),
+                    output,
+                );
+            }
+            ensure!(
+                confirm.as_deref().map(str::to_lowercase) == Some(hash.clone()),
+                "--confirm does not match the request's SHA-256 {hash}; nothing was sent"
+            );
+            let serial_file = serial_file.context("--serial-file is required for a real run")?;
+            with_sensor(&serial_file, output, |sensor, keys, steps| {
+                run_chip_new_user(sensor, keys, steps, &identity)
             })
         }
         Command::ChipEnroll {
@@ -642,6 +704,101 @@ fn run_db(
     Ok(())
 }
 
+/// The user storage's dbid in this sensor's database (checked at run time)
+const NEW_USER_STORAGE_DBID: u16 = 3;
+
+fn run_chip_new_user(
+    sensor: usb::Sensor,
+    keys: &pairing::HostKeys,
+    steps: &mut Map<String, Value>,
+    identity: &[u8],
+) -> Result<()> {
+    let (mut session, _) = device::open_session(&sensor, keys, &mut log(steps))?;
+    // Checks first, all reads
+    let before = db::parse_info(&session.cmd_ok(&sensor, &db::info_request())?)?;
+    ensure!(
+        before.free > 8192,
+        "not enough free space in the template database"
+    );
+    let response = session.cmd(&sensor, &db::user_storage_request("StgWindsor"))?;
+    let (status, payload) = proto::split_status(&response)?;
+    ensure!(
+        status == proto::STATUS_OK,
+        "no StgWindsor storage (status {status:04x}); nothing was written"
+    );
+    let storage = db::parse_user_storage(payload)?;
+    ensure!(
+        storage.dbid == NEW_USER_STORAGE_DBID,
+        "StgWindsor is record {}, not {NEW_USER_STORAGE_DBID}: the approved request does not apply; nothing was written",
+        storage.dbid
+    );
+    let lookup = |session: &mut syna_00a2::tls::Session| -> Result<Option<u16>> {
+        let response = session.cmd(
+            &sensor,
+            &db::user_by_identity_request(storage.dbid, identity),
+        )?;
+        let (status, payload) = proto::split_status(&response)?;
+        match status {
+            db::STATUS_NOT_FOUND => Ok(None),
+            proto::STATUS_OK => Ok(Some(db::parse_user_fingers(payload)?.0)),
+            other => bail!("looking up the user failed with status {other:04x}"),
+        }
+    };
+    ensure!(
+        lookup(&mut session)?.is_none(),
+        "a user with this SID already exists; nothing was written"
+    );
+    steps.insert(
+        "before".into(),
+        json!({ "db_info": before, "users": storage.users }),
+    );
+
+    // The write: unlock, create, commit (always, as python-validity does)
+    session
+        .cmd_ok(&sensor, &blobs::DB_WRITE_ENABLE)
+        .context("db_write_enable; nothing was written")?;
+    let request = db::new_user_request(storage.dbid, identity);
+    let created = session.cmd(&sensor, &request);
+    let commit = session.cmd(&sensor, &db::COMMIT_REQUEST);
+    let created = created?;
+    let (status, payload) = proto::split_status(&created)?;
+    let commit_status = proto::split_status(&commit?)?.0;
+    steps.insert(
+        "write".into(),
+        json!({
+            "header": hex(&request[..9]),
+            "store_status": format!("{status:04x}"),
+            "commit_status": format!("{commit_status:04x}"),
+        }),
+    );
+    ensure!(
+        status == proto::STATUS_OK,
+        "the sensor refused the user record (status {status:04x})"
+    );
+    ensure!(
+        [proto::STATUS_OK, db::STATUS_NOTHING_TO_COMMIT].contains(&commit_status),
+        "commit failed with status {commit_status:04x}"
+    );
+    ensure!(payload.len() >= 2, "no record id in the response");
+    let dbid = u16::from_le_bytes([payload[0], payload[1]]);
+
+    let after = db::parse_info(&session.cmd_ok(&sensor, &db::info_request())?)?;
+    let found = lookup(&mut session)?;
+    let users = db::parse_user_storage(
+        proto::split_status(&session.cmd(&sensor, &db::user_storage_request("StgWindsor"))?)?.1,
+    )?
+    .users;
+    steps.insert(
+        "after".into(),
+        json!({ "db_info": after, "new_user": dbid, "lookup_by_identity": found, "users": users }),
+    );
+    ensure!(
+        found == Some(dbid),
+        "the new user {dbid} is not found by its identity"
+    );
+    Ok(())
+}
+
 fn run_chip_enroll(
     sensor: usb::Sensor,
     keys: &pairing::HostKeys,
@@ -725,7 +882,8 @@ const MATCH_TIMEOUT: Duration = Duration::from_secs(10);
 struct IdentifyPlan {
     attempts: usize,
     finger_timeout: Duration,
-    match_user: u16,
+    /// Each scan is matched against these users in turn (0 = every user)
+    match_users: Vec<u16>,
 }
 
 fn run_chip_identify(
@@ -739,10 +897,10 @@ fn run_chip_identify(
     let IdentifyPlan {
         attempts,
         finger_timeout,
-        match_user,
+        ref match_users,
     } = *plan;
     let mut scanner = device::Scanner::open(sensor, keys, &mut log(steps))?;
-    steps.insert("match_user".into(), json!(match_user));
+    steps.insert("match_users".into(), json!(match_users));
 
     // The stored fingers, by subtype only: user records hold Windows SIDs
     let response = scanner
@@ -812,15 +970,29 @@ fn run_chip_identify(
                         &pgm(image.width, image.height, &image.pixels),
                     )?;
                 }
-                let decision = chip_match(&mut scanner, match_user);
                 let mut entry = json!({ "attempt": attempt, "result_pixels": image.pixels.len(), "stale_events": stale, "events": events, "held": held, "stalled": stalled });
-                match decision {
-                    Ok(decision) => entry["match"] = decision,
-                    Err(e) => {
-                        entry["error"] = format!("{e:#}").into();
-                        failure = Some(e);
+                // The same scan against each user in turn. "match" is the first
+                // user's decision; a later user that errors is recorded, not fatal.
+                let mut matches = Vec::new();
+                for (i, &user) in match_users.iter().enumerate() {
+                    match chip_match(&mut scanner, user) {
+                        Ok(decision) => {
+                            if i == 0 {
+                                entry["match"] = decision.clone();
+                            }
+                            matches.push(json!({ "match_user": user, "decision": decision }));
+                        }
+                        Err(e) if i == 0 => {
+                            entry["error"] = format!("{e:#}").into();
+                            failure = Some(e);
+                            break;
+                        }
+                        Err(e) => {
+                            matches.push(json!({ "match_user": user, "error": format!("{e:#}") }));
+                        }
                     }
                 }
+                entry["matches"] = matches.into();
                 results.push(entry);
                 // No pause before the next scan: identify scans don't wait for
                 // the lift, so the scanner rescans the held finger until it
@@ -1010,13 +1182,19 @@ fn score(enroll: &[PathBuf], probes: &[PathBuf], prepare: &str) -> Result<()> {
     Ok(())
 }
 
-fn chip_template(images: &[PathBuf], subtype: u16, out: &Path, poses: bool) -> Result<()> {
+fn chip_template(
+    images: &[PathBuf],
+    subtype: u16,
+    out: &Path,
+    poses: bool,
+    identity_header: bool,
+) -> Result<()> {
     let frames = images
         .iter()
         .map(|p| moh::extract(&read_pgm(p)?))
         .collect::<Result<Vec<_>>>()?;
     let (envelope, chosen) = if poses {
-        moh::template_with_poses(&frames, subtype)
+        moh::template_with_poses(&frames, subtype, !identity_header)
             .context("no four placements register against each other")?
     } else {
         (moh::template(&frames, subtype), moh::choose(&frames))
@@ -1037,7 +1215,7 @@ fn chip_template(images: &[PathBuf], subtype: u16, out: &Path, poses: bool) -> R
             "weak_frames": weak,
             "used": used,
             "subtype": format!("{subtype:#06x}"),
-            "poses": poses,
+            "poses": poses && !identity_header,
             "bytes": envelope.len(),
             "sha256": hex(&Sha256::digest(&envelope)),
         }),
