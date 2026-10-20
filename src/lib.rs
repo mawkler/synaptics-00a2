@@ -9,6 +9,7 @@ pub mod device;
 pub mod matcher;
 pub mod moh;
 pub mod pairing;
+pub mod pose;
 pub mod prog;
 pub mod proto;
 pub mod tables;

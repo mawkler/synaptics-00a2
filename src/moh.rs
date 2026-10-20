@@ -21,6 +21,7 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::matcher::SIDE;
+use crate::pose::{choose_registered, Pose};
 
 /// Envelope size: 8-byte header, tag-1 WS body, tag-2 template id, 32 zeros
 pub const ENVELOPE_SIZE: usize = 8 + 4 + WS_SIZE + 4 + 32 + 32;
@@ -554,8 +555,9 @@ pub fn extract(image: &[u8]) -> Result<Frame> {
     })
 }
 
-/// The WS-body framing with its inter-section transforms set to near-identity
-fn ws_scaffold() -> Vec<u8> {
+/// The WS-body framing. Its inter-section transforms are near-identity, or
+/// `poses` when given (one per section pair, in header order)
+fn ws_scaffold(poses: Option<&[Pose]>) -> Vec<u8> {
     let mut ws = vec![0u8; WS_SIZE];
     for (offset, chunk) in WS_SCAFFOLD_CHUNKS {
         let bytes: Vec<u8> = (0..chunk.len())
@@ -564,19 +566,41 @@ fn ws_scaffold() -> Vec<u8> {
             .collect();
         ws[offset..offset + bytes.len()].copy_from_slice(&bytes);
     }
-    let patched = patch_near_identity(&mut ws);
+    let records = pose_records(&ws);
     assert_eq!(
-        patched, WS_SCAFFOLD_PRE_V30_RECORDS,
+        records.len(),
+        WS_SCAFFOLD_PRE_V30_RECORDS,
         "the WS scaffold patch found the wrong number of transforms"
     );
+    for (k, &o) in records.iter().enumerate() {
+        let mut body = Vec::with_capacity(16);
+        match poses {
+            Some(poses) => {
+                // [b0][b1] at the record's start become the pair's fit counts
+                ws[o - 2] = poses[k].inliers;
+                ws[o - 1] = poses[k].quality;
+                for v in poses[k].q16() {
+                    body.extend(v.to_le_bytes());
+                }
+            }
+            None => {
+                for v in [0x10000_i32, 0, 1, 1] {
+                    body.extend(v.to_le_bytes());
+                }
+            }
+        }
+        ws[o..o + 16].copy_from_slice(&body);
+    }
     ws
 }
 
-/// Writes a = 1.0, b = 0, tx = ty = 1 (Q16) over each run of rigid
-/// transforms outside the record areas. The chip's matcher skips a pure
-/// identity as its "unmatched" sentinel, so a template whose sections share
-/// one geometry needs a near-identity. Returns the records patched.
-fn patch_near_identity(ws: &mut [u8]) -> usize {
+/// Where the inter-section rigid transforms (a, b, tx, ty as Q16 i32) sit
+/// outside the record areas. A record is [u8][u8][a][b][tx][ty]; the offsets
+/// returned are of `a`. python-validity writes a = 1.0, b = 0, tx = ty = 1
+/// over them: the chip's matcher skips a pure identity as its "unmatched"
+/// sentinel, so a template whose sections share one geometry needs a
+/// near-identity.
+fn pose_records(ws: &[u8]) -> Vec<usize> {
     const ONE: i128 = 0x10000;
     let mut zones = Vec::new();
     let mut prev = 0;
@@ -586,23 +610,18 @@ fn patch_near_identity(ws: &mut [u8]) -> usize {
     }
     zones.push((prev, ws.len()));
 
-    let int_at = |ws: &[u8], at: usize| {
-        i32::from_le_bytes(ws[at..at + 4].try_into().expect("4 bytes")) as i128
-    };
+    let int_at =
+        |at: usize| i32::from_le_bytes(ws[at..at + 4].try_into().expect("4 bytes")) as i128;
     // |a² + b² − 1| < 0.05 in Q16², exactly as Python compares an int with
     // ONE * ONE * 0.05
     let rigid = |a: i128, b: i128| (a * a + b * b - ONE * ONE).abs() * 20 < ONE * ONE;
-    let mut identity = Vec::new();
-    for v in [ONE as i32, 0, 1, 1] {
-        identity.extend(v.to_le_bytes());
-    }
 
-    let mut patched = 0;
+    let mut found = Vec::new();
     for (z0, z1) in zones {
         let mut best = (0, 0);
         for start in z0..z1 {
             let (mut o, mut n) = (start, 0);
-            while o + 18 <= z1 && rigid(int_at(ws, o + 2), int_at(ws, o + 6)) {
+            while o + 18 <= z1 && rigid(int_at(o + 2), int_at(o + 6)) {
                 n += 1;
                 o += 18;
             }
@@ -612,15 +631,10 @@ fn patch_near_identity(ws: &mut [u8]) -> usize {
         }
         let (n, start) = best;
         if n >= 2 {
-            for k in 0..n {
-                // [x][y] at the record's start stays
-                let o = start + 18 * k + 2;
-                ws[o..o + 16].copy_from_slice(&identity);
-                patched += 1;
-            }
+            found.extend((0..n).map(|k| start + 18 * k + 2));
         }
     }
-    patched
+    found
 }
 
 /// TemplateId: K = SHA-256(ws_body), T1 = HMAC(K, info), TID = HMAC(K, T1 ‖
@@ -661,11 +675,17 @@ fn envelope(subtype: u16, ws_body: &[u8]) -> Vec<u8> {
 
 /// The envelope with section k holding `sections[k % len]`
 pub fn assemble(sections: &[&[Keypoint]], subtype: u16) -> Vec<u8> {
+    assemble_with(sections, subtype, None)
+}
+
+/// [`assemble`], with the section-pair poses written into the header when
+/// given (see [`pose_table`])
+pub fn assemble_with(sections: &[&[Keypoint]], subtype: u16, poses: Option<&[Pose]>) -> Vec<u8> {
     assert!(
         !sections.is_empty(),
         "a template needs at least one section"
     );
-    let mut ws = ws_scaffold();
+    let mut ws = ws_scaffold(poses);
     for (k, base) in V30_REGIONS.iter().enumerate() {
         let start = base - V30_DESC_LEN;
         let area = &mut ws[start..start + V30_SECTION_BYTES];
@@ -698,6 +718,19 @@ pub fn template(frames: &[Frame], subtype: u16) -> Vec<u8> {
         .map(|k| frames[k].keypoints.as_slice())
         .collect();
     assemble(&sections, subtype)
+}
+
+/// [`template`], with the section poses estimated from the frames and the
+/// placements chosen so that all of them register (see
+/// [`crate::pose::choose_registered`]). Returns the envelope and the frame
+/// indices used, or None when no four placements register.
+pub fn template_with_poses(frames: &[Frame], subtype: u16) -> Option<(Vec<u8>, Vec<usize>)> {
+    let (used, poses) = choose_registered(frames)?;
+    let sections: Vec<&[Keypoint]> = used
+        .iter()
+        .map(|&k| frames[k].keypoints.as_slice())
+        .collect();
+    Some((assemble_with(&sections, subtype, Some(&poses)), used))
 }
 
 #[cfg(test)]
@@ -782,7 +815,7 @@ mod tests {
     #[test]
     fn envelope_matches_python_validity() {
         let v = vectors();
-        let scaffold = ws_scaffold();
+        let scaffold = ws_scaffold(None);
         assert_eq!(hex(&Sha256::digest(&scaffold)), v["scaffold_sha256"]);
         assert_eq!(hex(&template_id(&scaffold)), v["scaffold_template_id"]);
 

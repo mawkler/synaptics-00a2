@@ -175,6 +175,10 @@ enum Command {
         /// Where to write the envelope (mode 0600)
         #[arg(long)]
         out: PathBuf,
+        /// Estimate the sections' mutual poses instead of python-validity's
+        /// near-identity. Fails if the four placements don't register.
+        #[arg(long)]
+        poses: bool,
     },
     /// Offline: scores probe images against a template built from enrolled
     /// images, as the driver's matcher does. Prints scores only.
@@ -239,7 +243,8 @@ fn main() -> Result<()> {
             images,
             subtype,
             out,
-        } => chip_template(&images, subtype, &out),
+            poses,
+        } => chip_template(&images, subtype, &out, poses),
         Command::ChipIdentify {
             serial_file,
             attempts,
@@ -984,12 +989,17 @@ fn score(enroll: &[PathBuf], probes: &[PathBuf], prepare: &str) -> Result<()> {
     Ok(())
 }
 
-fn chip_template(images: &[PathBuf], subtype: u16, out: &Path) -> Result<()> {
+fn chip_template(images: &[PathBuf], subtype: u16, out: &Path, poses: bool) -> Result<()> {
     let frames = images
         .iter()
         .map(|p| moh::extract(&read_pgm(p)?))
         .collect::<Result<Vec<_>>>()?;
-    let envelope = moh::template(&frames, subtype);
+    let (envelope, chosen) = if poses {
+        moh::template_with_poses(&frames, subtype)
+            .context("no four placements register against each other")?
+    } else {
+        (moh::template(&frames, subtype), moh::choose(&frames))
+    };
     write_private(out, &envelope)?;
     let name = |p: &PathBuf| {
         p.file_name()
@@ -997,10 +1007,7 @@ fn chip_template(images: &[PathBuf], subtype: u16, out: &Path) -> Result<()> {
             .to_string_lossy()
             .into_owned()
     };
-    let used: Vec<_> = moh::choose(&frames)
-        .into_iter()
-        .map(|k| name(&images[k]))
-        .collect();
+    let used: Vec<_> = chosen.into_iter().map(|k| name(&images[k])).collect();
     let pools: Vec<_> = frames.iter().map(|f| f.pool).collect();
     let weak = pools.iter().filter(|&&n| n < moh::FRAME_KP_CAP).count();
     report(
@@ -1009,6 +1016,7 @@ fn chip_template(images: &[PathBuf], subtype: u16, out: &Path) -> Result<()> {
             "weak_frames": weak,
             "used": used,
             "subtype": format!("{subtype:#06x}"),
+            "poses": poses,
             "bytes": envelope.len(),
             "sha256": hex(&Sha256::digest(&envelope)),
         }),
