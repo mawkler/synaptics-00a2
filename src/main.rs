@@ -135,6 +135,12 @@ enum Command {
         /// being tested.
         #[arg(long, value_delimiter = ',', default_value = "0")]
         match_user: Vec<u16>,
+        /// With several --match-user ids: match each touch against only one
+        /// of them, in rotation (touch 1 the first id, touch 2 the second,
+        /// ...). The chip allows one match per scan, so this is how to compare
+        /// users under the same conditions.
+        #[arg(long)]
+        alternate: bool,
         /// Also save each scanned image here as LABEL-NN.pgm (mode 0600)
         #[arg(long)]
         save_dir: Option<PathBuf>,
@@ -282,6 +288,7 @@ fn main() -> Result<()> {
             attempts,
             finger_timeout,
             match_user,
+            alternate,
             save_dir,
             label,
             output,
@@ -307,6 +314,7 @@ fn main() -> Result<()> {
                         attempts,
                         finger_timeout: timeout,
                         match_users: match_user,
+                        alternate,
                     },
                     &cancelled,
                     save.as_ref(),
@@ -884,6 +892,8 @@ struct IdentifyPlan {
     finger_timeout: Duration,
     /// Each scan is matched against these users in turn (0 = every user)
     match_users: Vec<u16>,
+    /// Match each scan against one user only, in rotation
+    alternate: bool,
 }
 
 fn run_chip_identify(
@@ -898,6 +908,7 @@ fn run_chip_identify(
         attempts,
         finger_timeout,
         ref match_users,
+        alternate,
     } = *plan;
     let mut scanner = device::Scanner::open(sensor, keys, &mut log(steps))?;
     steps.insert("match_users".into(), json!(match_users));
@@ -974,7 +985,13 @@ fn run_chip_identify(
                 // The same scan against each user in turn. "match" is the first
                 // user's decision; a later user that errors is recorded, not fatal.
                 let mut matches = Vec::new();
-                for (i, &user) in match_users.iter().enumerate() {
+                let rotation = [match_users[results.len() % match_users.len()]];
+                let users = if alternate {
+                    &rotation[..]
+                } else {
+                    &match_users[..]
+                };
+                for (i, &user) in users.iter().enumerate() {
                     match chip_match(&mut scanner, user) {
                         Ok(decision) => {
                             if i == 0 {
