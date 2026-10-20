@@ -705,11 +705,6 @@ fn run_chip_enroll(
 
 /// How long the chip may take to report a match decision
 const MATCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// Identify-mode scans finish about 0.1 s after the touch without waiting for
-/// a lift, so the next scan would catch the same touch again (step 2a: 3
-/// touches gave 6 decisions). The scanner discards those; waiting this long
-/// between attempts lets the finger come off first.
-const IDENTIFY_PAUSE: Duration = Duration::from_millis(1500);
 
 fn run_chip_identify(
     sensor: usb::Sensor,
@@ -800,10 +795,13 @@ fn run_chip_identify(
                     }
                 }
                 results.push(entry);
+                // No pause before the next scan: identify scans don't wait for
+                // the lift, so the scanner rescans the held finger until it
+                // comes off. A touch that lands while no scan runs looks held
+                // and is lost (x1 lost one in three during a 1.5 s pause).
                 if failure.is_some() {
                     break;
                 }
-                std::thread::sleep(IDENTIFY_PAUSE);
             }
             Err(e) => {
                 results.push(

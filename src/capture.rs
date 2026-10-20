@@ -31,9 +31,10 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 /// cancelled scan, the next one sometimes stopped after `03 40 01` for good
 /// (r5, e3).
 const STALL_TIMEOUT: Duration = Duration::from_secs(3);
-/// A finger event this soon after the start means the finger was already down
-/// (step 2c: 52 ms for held touches, at least 536 ms for new ones)
-const HELD_FINGER: Duration = Duration::from_millis(150);
+/// A finger event this soon after the start event means the finger was
+/// already down. In 201 logged scans held fingers came 7–12 ms after it (one
+/// at 60 ms), new touches at least 108 ms after it.
+const HELD_FINGER: Duration = Duration::from_millis(40);
 /// python-validity caps the follow-up `0x51` reads the same way
 const MAX_RESULT_READS: usize = 8;
 
@@ -75,7 +76,8 @@ pub enum Scan {
     Image(Image),
     /// The scan completed, but the result header carries this error code,
     /// e.g. 0x80000 (M4d). python-validity retries the placement, so callers
-    /// should too.
+    /// should too. Codes below 0x10000 are the status of a failed result
+    /// read instead (0x0007 after an unusual `03 60 07` end, x1).
     Rejected(u32),
 }
 
@@ -183,8 +185,9 @@ impl<'a> Capture<'a> {
         );
         on_ready();
         while self.expect_event(finger_timeout, "finger")?[0] != EVENT_FINGER {}
-        let finger_ms = self.events.last().map_or(0, |e| e.ms);
-        self.held = check_held && finger_ms < HELD_FINGER.as_millis();
+        // Timed from the start event: the program takes about 40 ms to start
+        let since_start = self.events.last().map_or(0, |e| e.ms) - self.events[0].ms;
+        self.held = check_held && since_start < HELD_FINGER.as_millis();
         if !self.held {
             on_finger();
         }
@@ -214,10 +217,12 @@ impl<'a> Capture<'a> {
     /// The scan result: x, y, w1, w2 and an error code (`<HHHHL`), then x·y
     /// pixels, delivered over one or more `0x51` reads
     fn image(&mut self) -> Result<Scan> {
-        let first = self
-            .session
-            .cmd_ok(self.sensor, &proto::SCAN_RESULT_REQUEST)?;
-        let data = proto::scan_result_data(&first)?;
+        let response = self.session.cmd(self.sensor, &proto::SCAN_RESULT_REQUEST)?;
+        let (status, first) = proto::split_status(&response)?;
+        if status != proto::STATUS_OK {
+            return Ok(Scan::Rejected(status as u32));
+        }
+        let data = proto::scan_result_data(first)?;
         ensure!(
             data.len() >= 12,
             "scan result header too short: {} bytes",

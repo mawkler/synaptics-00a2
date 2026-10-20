@@ -36,7 +36,7 @@ const CALIBRATION_RETRY_WAIT: Duration = Duration::from_secs(1);
 /// Identify scans of a finger still down from the previous touch, discarded
 /// before giving up. Each takes about 0.4 s with the wait.
 const MAX_HELD: usize = 100;
-const HELD_RESCAN_WAIT: Duration = Duration::from_millis(300);
+const HELD_RESCAN_WAIT: Duration = Duration::from_millis(100);
 /// Pause between the capture stop that ends a stalled scan and the restart
 const STALL_RESTART_WAIT: Duration = Duration::from_millis(500);
 
