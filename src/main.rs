@@ -123,7 +123,8 @@ enum Command {
         /// File holding the DMI product serial (root-only in sysfs)
         #[arg(long)]
         serial_file: PathBuf,
-        /// Touches to match
+        /// Touches to match. A touch the sensor rejects counts too, so a run
+        /// always ends after this many touches.
         #[arg(long, default_value_t = 6)]
         attempts: usize,
         /// Seconds to wait for each touch
@@ -748,8 +749,8 @@ fn run_chip_identify(
     let is_cancelled = || cancelled.load(Ordering::Relaxed);
     let (mut results, mut rejected) = (Vec::new(), 0);
     let mut failure = None;
-    while results.len() < attempts {
-        let attempt = results.len() + 1;
+    while results.len() + rejected < attempts {
+        let attempt = results.len() + rejected + 1;
         let device::ScanOutcome {
             result,
             events,
@@ -771,7 +772,7 @@ fn run_chip_identify(
                 rejected += 1;
                 steps.insert(
                     format!("rejected_{rejected}"),
-                    json!({ "code": format!("{code:#x}"), "events": events, "held": held, "stalled": stalled }),
+                    json!({ "attempt": attempt, "code": format!("{code:#x}"), "events": events, "held": held, "stalled": stalled }),
                 );
                 if rejected > MAX_REJECTED {
                     failure = Some(anyhow::anyhow!("{rejected} placements rejected"));
