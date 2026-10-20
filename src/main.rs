@@ -210,6 +210,20 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Offline: the agreement (descriptor-consistent candidates) of every
+    /// frame in a manifest against every frame of the groups whose name starts
+    /// with a prefix. Writes the matrix of counts and the frame names.
+    PairMatrix {
+        /// JSON {"groups": {name: [pgm paths]}}
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Group-name prefix of the reference frames (the columns)
+        #[arg(long)]
+        refs_prefix: String,
+        /// Where to write the JSON report (mode 0600)
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// DATABASE WRITE. Creates one user record for a Linux uid under the
     /// StgWindsor user storage (python-validity's `new_user`): the
     /// db_write_enable blob, then 0x47, then 0x1a. Refuses if a user with that
@@ -359,6 +373,11 @@ fn main() -> Result<()> {
             })
         }
         Command::RepeatReport { manifest, output } => repeat_report(&manifest, &output),
+        Command::PairMatrix {
+            manifest,
+            refs_prefix,
+            output,
+        } => pair_matrix(&manifest, &refs_prefix, &output),
         Command::FrameGeneralisation { manifest, output } => {
             frame_generalisation(&manifest, &output)
         }
@@ -1456,6 +1475,68 @@ fn frame_generalisation(manifest: &Path, output: &Path) -> Result<()> {
     write_private(
         output,
         serde_json::to_string_pretty(&json!({ "frames": rows }))?.as_bytes(),
+    )
+}
+
+fn pair_matrix(manifest: &Path, refs_prefix: &str, output: &Path) -> Result<()> {
+    let manifest: Value = serde_json::from_slice(&fs::read(manifest)?)?;
+    let groups = manifest["groups"].as_object().context("no groups")?;
+    let mut names = Vec::new();
+    let mut frames = Vec::new();
+    for (name, paths) in groups {
+        for p in paths.as_array().context("a group is a list of paths")? {
+            let path = Path::new(p.as_str().context("path")?);
+            frames.push(moh::extract(&read_pgm(path)?)?);
+            names.push((
+                name.clone(),
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
+    }
+    let cols: Vec<usize> = (0..frames.len())
+        .filter(|&i| names[i].0.starts_with(refs_prefix))
+        .collect();
+    let (frames, cols) = (&frames, &cols);
+    let matrix: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let chunk = frames.len().div_ceil(8).max(1);
+        let handles: Vec<_> = (0..frames.len())
+            .step_by(chunk)
+            .map(|start| {
+                s.spawn(move || {
+                    (start..(start + chunk).min(frames.len()))
+                        .map(|i| {
+                            cols.iter()
+                                .map(|&j| {
+                                    if i == j {
+                                        0
+                                    } else {
+                                        pose::register(&frames[i].keypoints, &frames[j].keypoints)
+                                            .map_or(0, |p| p.candidates)
+                                    }
+                                })
+                                .collect::<Vec<u8>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("worker"))
+            .collect()
+    });
+    let label = |i: usize| json!({ "group": names[i].0, "file": names[i].1 });
+    write_private(
+        output,
+        serde_json::to_string(&json!({
+            "rows": (0..frames.len()).map(label).collect::<Vec<_>>(),
+            "cols": cols.iter().map(|&j| label(j)).collect::<Vec<_>>(),
+            "m": matrix,
+        }))?
+        .as_bytes(),
     )
 }
 
