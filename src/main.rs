@@ -188,6 +188,28 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Offline: descriptor-consistent agreement (see `pose::register`) between
+    /// every pair of frame groups in a manifest, same group included. Prints
+    /// summary statistics only.
+    RepeatReport {
+        /// JSON {"groups": {name: [pgm paths]}}
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Where to write the JSON report (mode 0600)
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Offline: for every frame, how well it agrees with the frames of the
+    /// OTHER groups that share its finger (the group name's part before the
+    /// first underscore), plus simple image statistics. Numbers only.
+    FrameGeneralisation {
+        /// JSON {"groups": {FINGER_session: [pgm paths]}}
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Where to write the JSON report (mode 0600)
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// DATABASE WRITE. Creates one user record for a Linux uid under the
     /// StgWindsor user storage (python-validity's `new_user`): the
     /// db_write_enable blob, then 0x47, then 0x1a. Refuses if a user with that
@@ -335,6 +357,10 @@ fn main() -> Result<()> {
                     save.as_ref(),
                 )
             })
+        }
+        Command::RepeatReport { manifest, output } => repeat_report(&manifest, &output),
+        Command::FrameGeneralisation { manifest, output } => {
+            frame_generalisation(&manifest, &output)
         }
         Command::ProbeScore {
             envelopes,
@@ -1294,6 +1320,142 @@ fn probe_score(envelopes: &[PathBuf], images: &[PathBuf], output: &Path) -> Resu
     write_private(
         output,
         serde_json::to_string_pretty(&json!({ "probes": rows }))?.as_bytes(),
+    )
+}
+
+fn repeat_report(manifest: &Path, output: &Path) -> Result<()> {
+    let manifest: Value = serde_json::from_slice(&fs::read(manifest)?)?;
+    let groups = manifest["groups"].as_object().context("no groups")?;
+    let mut frames: Vec<(String, Vec<moh::Frame>)> = Vec::new();
+    for (name, paths) in groups {
+        let list = paths
+            .as_array()
+            .context("a group is a list of paths")?
+            .iter()
+            .map(|p| moh::extract(&read_pgm(Path::new(p.as_str().context("path")?))?))
+            .collect::<Result<Vec<_>>>()?;
+        frames.push((name.clone(), list));
+    }
+    let stats = |mut v: Vec<u8>| {
+        v.sort_unstable();
+        let at = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+        json!({ "n": v.len(), "min": v[0], "median": at(0.5), "p90": at(0.9), "max": v[v.len() - 1] })
+    };
+    let mut report = Map::new();
+    for (i, (ni, fi)) in frames.iter().enumerate() {
+        for (nj, fj) in &frames[i..] {
+            let jobs: Vec<(usize, usize)> = (0..fi.len())
+                .flat_map(|a| (0..fj.len()).map(move |b| (a, b)))
+                .filter(|&(a, b)| ni != nj || a < b)
+                .collect();
+            let counts: Vec<u8> = std::thread::scope(|s| {
+                let chunk = jobs.len().div_ceil(8).max(1);
+                jobs.chunks(chunk)
+                    .map(|part| {
+                        s.spawn(move || {
+                            part.iter()
+                                .map(|&(a, b)| {
+                                    pose::register(&fi[a].keypoints, &fj[b].keypoints)
+                                        .map_or(0, |p| p.candidates)
+                                })
+                                .collect::<Vec<u8>>()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("worker"))
+                    .collect()
+            });
+            if !counts.is_empty() {
+                report.insert(format!("{ni} x {nj}"), stats(counts));
+            }
+        }
+    }
+    write_private(
+        output,
+        serde_json::to_string_pretty(&Value::Object(report))?.as_bytes(),
+    )
+}
+
+fn frame_generalisation(manifest: &Path, output: &Path) -> Result<()> {
+    let manifest: Value = serde_json::from_slice(&fs::read(manifest)?)?;
+    let groups = manifest["groups"].as_object().context("no groups")?;
+    struct Item {
+        group: String,
+        file: String,
+        frame: moh::Frame,
+        stats: [f64; 4],
+    }
+    let mut items = Vec::new();
+    for (name, paths) in groups {
+        for p in paths.as_array().context("a group is a list of paths")? {
+            let path = Path::new(p.as_str().context("path")?);
+            let pixels = read_pgm(path)?;
+            let n = pixels.len() as f64;
+            let mean = pixels.iter().map(|&v| v as f64).sum::<f64>() / n;
+            let sd = (pixels
+                .iter()
+                .map(|&v| (v as f64 - mean).powi(2))
+                .sum::<f64>()
+                / n)
+                .sqrt();
+            let dark = pixels.iter().filter(|&&v| v <= 2).count() as f64 / n;
+            let bright = pixels.iter().filter(|&&v| v >= 253).count() as f64 / n;
+            items.push(Item {
+                group: name.clone(),
+                file: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                frame: moh::extract(&pixels)?,
+                stats: [mean, sd, dark, bright],
+            });
+        }
+    }
+    let finger = |g: &str| g.split('_').next().unwrap_or(g).to_owned();
+    let items = &items;
+    let rows: Vec<Value> = std::thread::scope(|s| {
+        let chunk = items.len().div_ceil(8).max(1);
+        let handles: Vec<_> = (0..items.len())
+            .step_by(chunk)
+            .map(|start| {
+                s.spawn(move || {
+                    (start..(start + chunk).min(items.len()))
+                        .map(|i| {
+                            let it = &items[i];
+                            let mut counts: Vec<u8> = items
+                                .iter()
+                                .filter(|o| {
+                                    finger(&o.group) == finger(&it.group) && o.group != it.group
+                                })
+                                .map(|o| {
+                                    pose::register(&it.frame.keypoints, &o.frame.keypoints)
+                                        .map_or(0, |p| p.candidates)
+                                })
+                                .collect();
+                            counts.sort_unstable();
+                            let mean = counts.iter().map(|&c| c as f64).sum::<f64>()
+                                / counts.len().max(1) as f64;
+                            json!({
+                                "group": it.group, "file": it.file, "pool": it.frame.pool,
+                                "mean": it.stats[0], "sd": it.stats[1], "dark": it.stats[2], "bright": it.stats[3],
+                                "others": counts.len(), "gen_mean": mean,
+                                "gen_p90": counts.get(counts.len() * 9 / 10).copied().unwrap_or(0),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("worker"))
+            .collect()
+    });
+    write_private(
+        output,
+        serde_json::to_string_pretty(&json!({ "frames": rows }))?.as_bytes(),
     )
 }
 
