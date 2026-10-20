@@ -700,6 +700,35 @@ pub fn assemble_with(sections: &[&[Keypoint]], subtype: u16, poses: Option<&[Pos
     envelope(subtype, &ws)
 }
 
+/// The keypoints of each of an envelope's four sections (descriptor, x, y;
+/// the orientation isn't stored), without the zero-filled unused records
+pub fn sections(envelope: &[u8]) -> Result<Vec<Vec<Keypoint>>> {
+    ensure!(
+        envelope.len() == ENVELOPE_SIZE,
+        "a MoH envelope is {ENVELOPE_SIZE} bytes, not {}",
+        envelope.len()
+    );
+    let ws = &envelope[12..12 + WS_SIZE];
+    Ok(V30_REGIONS
+        .iter()
+        .map(|base| {
+            let start = base - V30_DESC_LEN;
+            ws[start..start + V30_SECTION_BYTES]
+                .as_chunks::<18>()
+                .0
+                .iter()
+                .filter(|r| r.iter().any(|&b| b != 0))
+                .map(|r| Keypoint {
+                    x: r[16] as i64,
+                    y: r[17] as i64,
+                    orientation: 0.0,
+                    descriptor: r[..16].try_into().expect("16 bytes"),
+                })
+                .collect()
+        })
+        .collect())
+}
+
 /// Picks placements for the template's sections: the four largest pools, in
 /// capture order. This approximates the DLL, which picks by a learned quality
 /// score and keeps only keypoints that agree across placements.

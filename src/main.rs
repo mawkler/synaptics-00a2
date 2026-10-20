@@ -17,6 +17,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use syna_00a2::pose;
 use syna_00a2::{blobs, calibrate, capture, db, device, matcher, moh, pairing, proto, tables, usb};
 
 #[derive(Parser)]
@@ -173,6 +174,20 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Offline: registers each probe image's keypoints against every section
+    /// of each template envelope and prints inlier counts only (no images,
+    /// no keypoints).
+    ProbeScore {
+        /// Template envelopes (23136 bytes)
+        #[arg(long, num_args = 1.., required = true)]
+        envelopes: Vec<PathBuf>,
+        /// 112×112 PGMs to score
+        #[arg(long, num_args = 1.., required = true)]
+        images: Vec<PathBuf>,
+        /// Where to write the JSON report (mode 0600)
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// DATABASE WRITE. Creates one user record for a Linux uid under the
     /// StgWindsor user storage (python-validity's `new_user`): the
     /// db_write_enable blob, then 0x47, then 0x1a. Refuses if a user with that
@@ -321,6 +336,11 @@ fn main() -> Result<()> {
                 )
             })
         }
+        Command::ProbeScore {
+            envelopes,
+            images,
+            output,
+        } => probe_score(&envelopes, &images, &output),
         Command::ChipNewUser {
             serial_file,
             uid,
@@ -1237,6 +1257,43 @@ fn chip_template(
             "sha256": hex(&Sha256::digest(&envelope)),
         }),
         None,
+    )
+}
+
+fn probe_score(envelopes: &[PathBuf], images: &[PathBuf], output: &Path) -> Result<()> {
+    let name = |p: &PathBuf| {
+        p.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let templates = envelopes
+        .iter()
+        .map(|p| {
+            let data = fs::read(p).with_context(|| format!("reading {}", p.display()))?;
+            Ok((name(p), moh::sections(&data)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut rows = Vec::new();
+    for path in images {
+        let frame = moh::extract(&read_pgm(path)?)?;
+        let mut scores = Map::new();
+        for (template, sections) in &templates {
+            let per_section: Vec<_> = sections
+                .iter()
+                .map(|s| {
+                    pose::register(&frame.keypoints, s).map_or(json!([0, 0, 0]), |p| {
+                        json!([p.inliers, p.quality, p.candidates])
+                    })
+                })
+                .collect();
+            scores.insert(template.clone(), json!(per_section));
+        }
+        rows.push(json!({ "image": name(path), "pool": frame.pool, "scores": scores }));
+    }
+    write_private(
+        output,
+        serde_json::to_string_pretty(&json!({ "probes": rows }))?.as_bytes(),
     )
 }
 

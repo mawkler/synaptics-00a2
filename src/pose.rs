@@ -39,6 +39,9 @@ type Pair = (Pt, Pt);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pose {
+    /// Descriptor-matched candidates that agree with the pose (at most
+    /// [`CANDIDATES`]); 0 until [`register`] has counted them
+    pub candidates: u8,
     pub inliers: u8,
     pub quality: u8,
     /// Radians
@@ -80,6 +83,7 @@ fn from_two(p: [Pt; 2], q: [Pt; 2]) -> Option<Pose> {
     let tx = (q[0].0 + q[1].0 - (c * (p[0].0 + p[1].0) - s * (p[0].1 + p[1].1))) / 2.0;
     let ty = (q[0].1 + q[1].1 - (s * (p[0].0 + p[1].0) + c * (p[0].1 + p[1].1))) / 2.0;
     Some(Pose {
+        candidates: 0,
         inliers: 0,
         quality: 0,
         theta: s.atan2(c),
@@ -105,6 +109,7 @@ fn least_squares(pairs: &[Pair]) -> Pose {
     let theta = (sxy - syx).atan2(sxx + syy);
     let (s, c) = theta.sin_cos();
     Pose {
+        candidates: 0,
         inliers: 0,
         quality: 0,
         theta,
@@ -212,6 +217,7 @@ pub fn register(a: &[Keypoint], b: &[Keypoint]) -> Option<Pose> {
     } else {
         near.iter().map(|d| d.sqrt()).sum::<f64>() / near.len() as f64
     };
+    pose.candidates = agree(&pose, &pairs) as u8;
     pose.inliers = near.len().min(255) as u8;
     pose.quality = ((mean_err * QUALITY_PER_PX).round() as u8).min(MAX_QUALITY - 1);
     Some(pose)
@@ -318,6 +324,7 @@ mod tests {
     #[test]
     fn recovers_a_known_pose() {
         let want = Pose {
+            candidates: 0,
             inliers: 0,
             quality: 0,
             theta: 5.0_f64.to_radians(),
@@ -335,6 +342,7 @@ mod tests {
     #[test]
     fn unrelated_sections_do_not_register() {
         let (a, _) = scene(&Pose {
+            candidates: 0,
             inliers: 0,
             quality: 0,
             theta: 0.0,
@@ -351,6 +359,7 @@ mod tests {
     #[test]
     fn q16_keeps_unit_rotation() {
         let p = Pose {
+            candidates: 0,
             inliers: 90,
             quality: 33,
             theta: -0.0614,
