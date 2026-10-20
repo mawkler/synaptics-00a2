@@ -130,6 +130,11 @@ enum Command {
         /// Seconds to wait for each touch
         #[arg(long, default_value_t = 30)]
         finger_timeout: u64,
+        /// Restrict the chip's match to this user record id (0 = every user,
+        /// as python-validity). Experimental: whether the chip honours it is
+        /// being tested.
+        #[arg(long, default_value_t = 0)]
+        match_user: u16,
         /// Also save each scanned image here as LABEL-NN.pgm (mode 0600)
         #[arg(long)]
         save_dir: Option<PathBuf>,
@@ -249,6 +254,7 @@ fn main() -> Result<()> {
             serial_file,
             attempts,
             finger_timeout,
+            match_user,
             save_dir,
             label,
             output,
@@ -270,8 +276,11 @@ fn main() -> Result<()> {
                     sensor,
                     keys,
                     steps,
-                    attempts,
-                    timeout,
+                    &IdentifyPlan {
+                        attempts,
+                        finger_timeout: timeout,
+                        match_user,
+                    },
                     &cancelled,
                     save.as_ref(),
                 )
@@ -712,16 +721,28 @@ fn run_chip_enroll(
 /// How long the chip may take to report a match decision
 const MATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What a chip-identify run asks for
+struct IdentifyPlan {
+    attempts: usize,
+    finger_timeout: Duration,
+    match_user: u16,
+}
+
 fn run_chip_identify(
     sensor: usb::Sensor,
     keys: &pairing::HostKeys,
     steps: &mut Map<String, Value>,
-    attempts: usize,
-    finger_timeout: Duration,
+    plan: &IdentifyPlan,
     cancelled: &AtomicBool,
     save: Option<&(PathBuf, String)>,
 ) -> Result<()> {
+    let IdentifyPlan {
+        attempts,
+        finger_timeout,
+        match_user,
+    } = *plan;
     let mut scanner = device::Scanner::open(sensor, keys, &mut log(steps))?;
+    steps.insert("match_user".into(), json!(match_user));
 
     // The stored fingers, by subtype only: user records hold Windows SIDs
     let response = scanner
@@ -791,7 +812,7 @@ fn run_chip_identify(
                         &pgm(image.width, image.height, &image.pixels),
                     )?;
                 }
-                let decision = chip_match(&mut scanner);
+                let decision = chip_match(&mut scanner, match_user);
                 let mut entry = json!({ "attempt": attempt, "result_pixels": image.pixels.len(), "stale_events": stale, "events": events, "held": held, "stalled": stalled });
                 match decision {
                     Ok(decision) => entry["match"] = decision,
@@ -825,11 +846,11 @@ fn run_chip_identify(
 /// The chip's own match of the last identify-mode scan against everything
 /// stored, as python-validity's `Sensor.match_finger`. The cleanup command
 /// is always sent; its result is reported but not checked.
-fn chip_match(scanner: &mut device::Scanner) -> Result<Value> {
+fn chip_match(scanner: &mut device::Scanner, user: u16) -> Result<Value> {
     let decision = (|| -> Result<Value> {
         scanner
             .session
-            .cmd_ok(&scanner.sensor, &db::MATCH_REQUEST)?;
+            .cmd_ok(&scanner.sensor, &db::match_request(user))?;
         let deadline = std::time::Instant::now() + MATCH_TIMEOUT;
         let event = loop {
             if let Some(event) = scanner.sensor.read_interrupt(Duration::from_millis(100))? {

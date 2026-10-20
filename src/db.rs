@@ -250,6 +250,16 @@ pub const STATUS_NOTHING_TO_COMMIT: u16 = 0x0491;
 /// Starts an on-chip identify of the last scan against every storage and
 /// user: `<BBBHHHHH` 0x5e, 2, 0xff, storage 0, user 0, 1, 0, 0
 pub const MATCH_REQUEST: [u8; 13] = [0x5e, 0x02, 0xff, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0];
+/// [`MATCH_REQUEST`] restricted to one user record id (0 = every user). The
+/// Windows driver's builder (`FUN_180085df0`) lays the command out as: mode,
+/// 0xff, storage u16, user u16, a u16 (1), then a u32 payload length and the
+/// payload. Whether the chip honours the user field is an open question.
+pub fn match_request(user: u16) -> [u8; 13] {
+    let mut request = MATCH_REQUEST;
+    request[5..7].copy_from_slice(&user.to_le_bytes());
+    request
+}
+
 /// Fetches the match result after the "recognised" event
 pub const MATCH_RESULT_REQUEST: [u8; 5] = [0x60, 0, 0, 0, 0];
 /// Ends the identify; python-validity always sends it and ignores errors
@@ -335,6 +345,11 @@ mod tests {
         assert_eq!(
             MATCH_REQUEST.to_vec(),
             unhex("5e02ff 0000 0000 0100 0000 0000")
+        );
+        assert_eq!(match_request(0), MATCH_REQUEST);
+        assert_eq!(
+            match_request(5).to_vec(),
+            unhex("5e02ff 0000 0500 0100 0000 0000")
         );
         assert_eq!(user_request(5), unhex("4a 0500 0000 0000"));
     }
