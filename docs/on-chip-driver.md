@@ -74,8 +74,10 @@ same user. `clear_storage` stays unimplemented.
 ## Prints
 
 - `FPI_PRINT_RAW`, `fpi_print_set_device_stored (TRUE)`. The fpi-data is a
-  GVariant `(qqqay)`: the user record, the finger record, the subtype, and
-  the 32-byte TID.
+  GVariant `(uqqq)`: the Linux uid, the user record, the finger record and
+  the subtype. No TID: the chip refuses a second finger with the same subtype
+  under one user (`0x04c3`), and the match result carries the user record and
+  subtype, so (user record, subtype) names exactly one finger.
 - `fp_print_equal` compares the type, driver, device id and `g_variant_equal`
   of that data. Every field can be read back from the chip, so `list` rebuilds
   prints that compare equal to the enrolled ones.
@@ -91,11 +93,11 @@ All of these run in the existing GTask workers on the open session.
 | vfunc | What it does | DB writes |
 |---|---|---|
 | open / close | As now: session, calibration (no change) | none |
-| enroll | Enroll-mode touches (stages; a frame whose pool is under 250 is a retry), `moh::template` with the subtype, then: find the Linux user (`0x4a` by identity), or **create it**; check free space (else `DATA_FULL`); **store the finger**; read back its record and TID | user record (first enrollment only), finger record |
-| verify | Identify-mode touch (held-finger skip, stall restart), chip match, `0x60` result. Match only if recognised **and** the TID equals the print's. A rejected scan is a retry. | none |
-| identify | Same scan and match. Report the gallery print with that TID. If the TID is a Linux-owned record that isn't in the gallery, report it as the device print (fprintd's garbage collection). A foreign TID, or not recognised, reports no match. | none |
-| list | StgWindsor → Linux-owned users → fingers → `0x49` value → TID → prints (finger from the subtype, username from the uid) | none |
-| delete | Re-read the record. Refuse unless it is Linux-owned and its TID matches the print. Then **delete the finger**, and the user record once it is empty. | finger record (and user record) |
+| enroll | Enroll-mode touches (stages), `moh::template` with the subtype, then: check free space (else `DATA_FULL`); find the Linux user (`0x4a` by identity), or **create it**; **delete** an old finger with the same subtype under that user (the stale copy of this finger); **store the finger** | user record (first enrollment only), finger record (and the stale one) |
+| verify | Identify-mode touch (held-finger skip, stall restart), chip match restricted to the print's user record, `0x60` result. Match only if recognised **and** the result's user record and subtype are the print's. A rejected scan is a retry. | none |
+| identify | Same scan and match, restricted to the gallery's user record when there is only one (the chip matches a scan once, so a mixed gallery is matched against every user and filtered). Report the gallery print with that user record and subtype; anything else, or not recognised, reports no match. | none |
+| list | StgWindsor → Linux-owned users → fingers → prints (finger from the subtype, username from the uid) | none |
+| delete | Re-read the user record. Refuse (`DATA_NOT_FOUND`) unless it is the print's Linux uid and holds that finger. Then **delete the finger**, and the user record once it is empty. | finger record (and user record) |
 | clear_storage | not implemented, on purpose | — |
 
 Matching scope: `0x5e` with user 0 searches every template. A foreign record
@@ -151,6 +153,20 @@ free, room for about 19 templates.
    don't carry "0".
 8. Suspend during an on-chip action: libfprint completes it with
    `NOT_SUPPORTED` (no suspend vfunc). Confirm that fprintd recovers.
+
+## Implementation status (2026-10-21)
+
+Steps 1 to 3 below are implemented (syna-00a2 `src/chip.rs`, CLI
+`chip-new-user`, `chip-enroll`, `chip-identify --match-user`, `chip-delete`,
+and the TOD module), offline-checked only: libfprint-tod loads the module and
+reports `storage`, `storage-list` and `storage-delete`. Not yet run on the
+sensor: delete (`0x48`, open question 4), the TOD's enroll/verify/identify/list
+on device-stored prints, and fprintd's flows. The enrollment policy (one
+template from 10 touches) waits for the cross-day result.
+
+Before running fprintd against the module, note that the test users created
+by hand (uids 90001–90003, records 14, 15, 18) are Linux-owned by the SID
+rule, so `list` reports their fingers, and fprintd may delete them.
 
 ## Implementation steps (after questions 1 to 4)
 

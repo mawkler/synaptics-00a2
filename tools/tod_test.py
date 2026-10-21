@@ -3,7 +3,11 @@
 """Drives the TOD module through libfprint-tod the way fprintd would.
 
   tod_test.py --typelib DIR --drivers DIR --serial-file F COMMAND ...
-    enroll --out PRINT                     10 touch-and-lift placements
+    enroll --out PRINT [--finger F]        10 touch-and-lift placements; the
+                                           template goes onto the sensor (a
+                                           database write) under your user
+    list                                   the prints stored on the sensor
+    delete --print PRINT                   delete one stored print (a write)
     verify --print PRINT --attempts N      N attempts against one print
     identify --print PRINT... --attempts N N attempts against several
     reopen --cycles N                      open/close back to back, no touch
@@ -16,15 +20,16 @@
                                            open the new device and verify once
 
 Opening calibrates for about a second: keep the sensor clear. A rejected
-placement is retried. Prints finger-status changes, progress, decisions and
-match scores, never image data; serialized prints are written mode 0600.
+placement is retried. Prints finger-status changes, progress and decisions,
+never image data; serialized prints (which only name a stored finger) are
+written mode 0600.
 """
 
 import argparse
 import gc
+import getpass
 import json
 import os
-import re
 import signal
 import sys
 import time
@@ -38,7 +43,11 @@ def main():
     parser.add_argument('--output', help='also write the JSON report here (0600)')
     parser.add_argument('--trace', help="have the driver append each scan's raw events here (SYNA_00A2_TRACE)")
     sub = parser.add_subparsers(dest='command', required=True)
-    sub.add_parser('enroll').add_argument('--out', required=True)
+    p = sub.add_parser('enroll')
+    p.add_argument('--out', required=True)
+    p.add_argument('--finger', default='right-middle', help='e.g. right-middle, left-index')
+    sub.add_parser('list')
+    sub.add_parser('delete').add_argument('--print', required=True, dest='prints', type=lambda v: [v])
     for name in ('verify', 'identify'):
         p = sub.add_parser(name)
         p.add_argument('--print', nargs='+', required=True, dest='prints')
@@ -63,19 +72,14 @@ def main():
     loop = GLib.main_context_default()
     started = time.monotonic()
     report = {'command': args.command, 'events': []}
-    scores = []
 
     def event(kind, **fields):
         entry = dict(t=round(time.monotonic() - started, 2), event=kind, **fields)
         report['events'].append(entry)
         print(json.dumps(entry), flush=True)
 
-    # The driver logs each template's score from its worker thread
     def driver_log(domain, level, message, *_):
-        found = re.search(r'Template (\d+) scored ([0-9.]+)', message)
-        if found:
-            scores.append((int(found.group(1)), float(found.group(2))))
-        elif level & (GLib.LogLevelFlags.LEVEL_WARNING | GLib.LogLevelFlags.LEVEL_CRITICAL):
+        if level & (GLib.LogLevelFlags.LEVEL_WARNING | GLib.LogLevelFlags.LEVEL_CRITICAL):
             event('driver_warning', message=message)
     GLib.log_set_handler('libfprint-syna_00a2', GLib.LogLevelFlags.LEVEL_MASK, driver_log, None)
 
@@ -139,7 +143,6 @@ def main():
     def attempt(dev, prints, mode, action, on_finger=None):
         """One verify/identify; returns the outcome dict (retries are outcomes too)"""
         outcome = {}
-        del scores[:]
 
         def done_cb(dev, res):
             try:
@@ -163,7 +166,6 @@ def main():
         wait(lambda: outcome, 'result', seconds=300, action=action)
         if handler:
             dev.disconnect(handler)
-        outcome['scores'] = [round(s, 3) for _, s in sorted(scores)]
         return outcome
 
     def attempts(dev, prints, mode, count):
@@ -209,7 +211,8 @@ def main():
                     done['error'] = e.message
 
             template = FPrint.Print.new(dev)
-            template.set_finger(FPrint.Finger.UNKNOWN)
+            template.set_finger(getattr(FPrint.Finger, args.finger.upper().replace('-', '_')))
+            template.set_username(getpass.getuser())
             dev.enroll(template, cancellable, progress_cb, tuple(), enroll_done)
             wait(lambda: done, 'enrollment', seconds=600, action=cancellable)
             if 'error' in done:
@@ -219,6 +222,15 @@ def main():
             os.write(fd, data)
             os.close(fd)
             event('enrolled', print_bytes=len(data), file=args.out)
+
+        elif args.command == 'list':
+            prints = dev.list_prints_sync()
+            report['results'] = [{'finger': p.get_finger().value_nick, 'username': p.get_username()} for p in prints]
+            event('listed', prints=report['results'])
+
+        elif args.command == 'delete':
+            dev.delete_print_sync(load_prints()[0])
+            event('deleted', file=args.prints[0])
 
         elif args.command in ('verify', 'identify'):
             report['results'] = attempts(dev, load_prints(), args.command, args.attempts)

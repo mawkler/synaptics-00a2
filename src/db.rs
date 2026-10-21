@@ -181,6 +181,11 @@ pub fn user_request(dbid: u16) -> Vec<u8> {
 /// storage, value size) per finger, then the identity, which is skipped:
 /// it is the Windows account's SID
 pub fn parse_user_fingers(p: &[u8]) -> Result<(u16, Vec<Finger>)> {
+    parse_user(p).map(|(dbid, fingers, _)| (dbid, fingers))
+}
+
+/// [`parse_user_fingers`] with the identity bytes
+pub fn parse_user(p: &[u8]) -> Result<(u16, Vec<Finger>, Vec<u8>)> {
     let count = u16_at(p, 2)? as usize;
     let identity_size = u16_at(p, 6)? as usize;
     ensure!(
@@ -198,7 +203,7 @@ pub fn parse_user_fingers(p: &[u8]) -> Result<(u16, Vec<Finger>)> {
             })
         })
         .collect::<Result<_>>()?;
-    Ok((u16_at(p, 0)?, fingers))
+    Ok((u16_at(p, 0)?, fingers, p[8 + 8 * count..].to_vec()))
 }
 
 /// Finger names for WinBio subtypes (python-validity's fingerprint_constants)
@@ -264,6 +269,20 @@ pub fn linux_identity(uid: u32) -> Vec<u8> {
     value.extend(sid);
     value.resize(0x4c, 0);
     value
+}
+
+/// The Linux uid of a user record whose identity is [`linux_identity`] (with
+/// or without its zero padding), or None for any other identity
+pub fn linux_uid(identity: &[u8]) -> Option<u32> {
+    let uid = u32::from_le_bytes(identity.get(32..36)?.try_into().ok()?);
+    linux_identity(uid).starts_with(identity).then_some(uid)
+}
+
+/// `0x48`, python-validity's `del_record`: `<BH`, the record's dbid
+pub fn delete_request(dbid: u16) -> Vec<u8> {
+    let mut request = vec![0x48];
+    request.extend(dbid.to_le_bytes());
+    request
 }
 
 /// `0x4a` by identity: `<BHHH`, 0, the storage's dbid, the identity's size,
@@ -389,6 +408,13 @@ mod tests {
         assert_eq!(want.len(), 0x4c);
         assert_eq!(linux_identity(90001), want);
         assert_ne!(linux_identity(90001), linux_identity(90002));
+        assert_eq!(linux_uid(&want), Some(90001));
+        assert_eq!(linux_uid(&want[..36]), Some(90001));
+        assert_eq!(linux_uid(&want[..35]), None);
+        let mut windows = want.clone();
+        windows[20] ^= 1;
+        assert_eq!(linux_uid(&windows), None);
+        assert_eq!(delete_request(0x13), unhex("48 1300"));
         let request = new_user_request(3, &want);
         assert_eq!(request[..9], unhex("47 0300 0500 0300 4c00")[..9]);
         assert_eq!(request.len(), 9 + 0x4c);

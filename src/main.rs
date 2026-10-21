@@ -18,7 +18,9 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use syna_00a2::pose;
-use syna_00a2::{blobs, calibrate, capture, db, device, matcher, moh, pairing, proto, tables, usb};
+use syna_00a2::{
+    blobs, calibrate, capture, chip, db, device, matcher, moh, pairing, proto, tables, usb,
+};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -229,6 +231,37 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// DATABASE WRITE. Deletes one finger record the way the driver does
+    /// (`chip::delete`): only if its user record is Linux uid's and holds that
+    /// finger; the user record goes too once it is empty. `--dry-run` prints
+    /// the requests without opening the sensor. A real run needs `--confirm`
+    /// to repeat `--finger`.
+    ChipDelete {
+        /// File holding the DMI product serial (root-only in sysfs)
+        #[arg(long)]
+        serial_file: Option<PathBuf>,
+        /// Linux uid in the user record's SID
+        #[arg(long)]
+        uid: u32,
+        /// The user record
+        #[arg(long)]
+        user: u16,
+        /// The finger record
+        #[arg(long)]
+        finger: u16,
+        /// The finger's subtype
+        #[arg(long, value_parser = parse_u16)]
+        subtype: u16,
+        /// Print the requests, send nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// The finger record again, as approved
+        #[arg(long)]
+        confirm: Option<u16>,
+        /// Also write the JSON report here (mode 0600)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// DATABASE WRITE. Creates one user record for a Linux uid under the
     /// StgWindsor user storage (python-validity's `new_user`): the
     /// db_write_enable blob, then 0x47, then 0x1a. Refuses if a user with that
@@ -392,6 +425,53 @@ fn main() -> Result<()> {
             output,
             counts,
         } => probe_score(&envelopes, &images, &output, counts),
+        Command::ChipDelete {
+            serial_file,
+            uid,
+            user,
+            finger,
+            subtype,
+            dry_run,
+            confirm,
+            output,
+        } => {
+            let print = chip::Stored {
+                uid,
+                user,
+                finger,
+                subtype,
+            };
+            if dry_run {
+                return report(
+                    &json!({
+                        "finger_request": hex(&db::delete_request(finger)),
+                        "then_if_the_user_record_is_left_empty": hex(&db::delete_request(user)),
+                        "each_followed_by": hex(&db::COMMIT_REQUEST),
+                    }),
+                    output,
+                );
+            }
+            ensure!(
+                confirm == Some(finger),
+                "--confirm must repeat --finger; nothing was sent"
+            );
+            let serial_file = serial_file.context("--serial-file is required for a real run")?;
+            with_sensor(&serial_file, output, |sensor, keys, steps| {
+                let (mut session, _) = device::open_session(&sensor, keys, &mut log(steps))?;
+                let state = |session: &mut syna_00a2::tls::Session| -> Result<Value> {
+                    let info = db::parse_info(&session.cmd_ok(&sensor, &db::info_request())?)?;
+                    let prints = chip::list(session, &sensor)?;
+                    Ok(json!({
+                        "db_info": info,
+                        "linux_prints": prints.iter().map(|p| json!([p.uid, p.user, p.finger, p.subtype])).collect::<Vec<_>>(),
+                    }))
+                };
+                steps.insert("before".into(), state(&mut session)?);
+                let deleted = chip::delete(&mut session, &sensor, &print);
+                steps.insert("after".into(), state(&mut session)?);
+                deleted
+            })
+        }
         Command::ChipNewUser {
             serial_file,
             uid,
@@ -954,9 +1034,6 @@ fn run_chip_enroll(
     Ok(())
 }
 
-/// How long the chip may take to report a match decision
-const MATCH_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// What a chip-identify run asks for
 struct IdentifyPlan {
     attempts: usize,
@@ -1103,51 +1180,26 @@ fn run_chip_identify(
     failure.map_or(Ok(()), Err)
 }
 
-/// The chip's own match of the last identify-mode scan against everything
-/// stored, as python-validity's `Sensor.match_finger`. The cleanup command
-/// is always sent; its result is reported but not checked.
+/// The chip's own match of the last identify-mode scan (see
+/// [`chip::chip_match`]), as a report
 fn chip_match(scanner: &mut device::Scanner, user: u16) -> Result<Value> {
-    let decision = (|| -> Result<Value> {
-        scanner
-            .session
-            .cmd_ok(&scanner.sensor, &db::match_request(user))?;
-        let deadline = std::time::Instant::now() + MATCH_TIMEOUT;
-        let event = loop {
-            if let Some(event) = scanner.sensor.read_interrupt(Duration::from_millis(100))? {
-                break event;
-            }
-            ensure!(
-                std::time::Instant::now() < deadline,
-                "no match decision within {} s",
-                MATCH_TIMEOUT.as_secs()
-            );
-        };
-        if event.first() != Some(&db::EVENT_RECOGNISED) {
-            return Ok(json!({ "recognised": false, "event": hex(&event) }));
-        }
-        let result = db::parse_match_result(
-            &scanner
-                .session
-                .cmd_ok(&scanner.sensor, &db::MATCH_RESULT_REQUEST)?,
-        )?;
-        Ok(json!({
+    let decision = chip::chip_match(&mut scanner.session, &scanner.sensor, user)?;
+    let mut report = match &decision.result {
+        None => json!({ "recognised": false, "event": hex(&decision.event) }),
+        Some(result) => json!({
             "recognised": true,
-            "event": hex(&event),
+            "event": hex(&decision.event),
             "user": result.user,
             "subtype": result.subtype,
             "finger": db::subtype_name(result.subtype),
             "hash_prefix": &result.hash[..result.hash.len().min(16)],
-        }))
-    })();
-    let cleanup = scanner
-        .session
-        .cmd(&scanner.sensor, &db::MATCH_CLEANUP_REQUEST);
-    let mut decision = decision?;
-    decision["cleanup"] = match cleanup {
+        }),
+    };
+    report["cleanup"] = match decision.cleanup {
         Ok(response) => hex(&response).into(),
         Err(e) => format!("error: {e:#}").into(),
     };
-    Ok(decision)
+    Ok(report)
 }
 
 /// Rejected placements (sensor scan errors) tolerated per capture run

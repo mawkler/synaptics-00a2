@@ -4,6 +4,7 @@
 pub mod blobs;
 pub mod calibrate;
 pub mod capture;
+pub mod chip;
 pub mod db;
 pub mod device;
 pub mod matcher;

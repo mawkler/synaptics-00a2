@@ -15,9 +15,11 @@ use std::{
 
 use anyhow::{ensure, Context, Result};
 use syna_00a2::{
+    calibrate,
     capture::Scan,
+    chip::{self, DataFull, NotFound, Stored},
     device::{self, ScanOutcome, Scanner},
-    matcher::{self, Matcher, Template},
+    matcher, moh,
     pairing::HostKeys,
     usb,
 };
@@ -25,7 +27,51 @@ use syna_00a2::{
 pub const SYNA_IMAGE: c_int = 0;
 pub const SYNA_RETRY: c_int = 1;
 pub const SYNA_CANCELLED: c_int = 2;
+pub const SYNA_MATCH: c_int = 3;
+pub const SYNA_NO_MATCH: c_int = 4;
+pub const SYNA_DATA_FULL: c_int = 5;
+pub const SYNA_NOT_FOUND: c_int = 6;
+pub const SYNA_OK: c_int = 0;
 pub const SYNA_ERROR: c_int = -1;
+
+/// A finger stored on the sensor, as the C side keeps it in the print
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SynaPrint {
+    pub uid: u32,
+    pub user: u16,
+    pub finger: u16,
+    pub subtype: u16,
+}
+
+/// The chip's match: user record and finger subtype
+#[repr(C)]
+pub struct SynaMatch {
+    pub user: u32,
+    pub subtype: u16,
+}
+
+impl From<Stored> for SynaPrint {
+    fn from(s: Stored) -> Self {
+        Self {
+            uid: s.uid,
+            user: s.user,
+            finger: s.finger,
+            subtype: s.subtype,
+        }
+    }
+}
+
+impl From<SynaPrint> for Stored {
+    fn from(p: SynaPrint) -> Self {
+        Self {
+            uid: p.uid,
+            user: p.user,
+            finger: p.finger,
+            subtype: p.subtype,
+        }
+    }
+}
 
 pub const SYNA_STATUS_NEEDED: c_int = 1;
 pub const SYNA_STATUS_PRESENT: c_int = 2;
@@ -134,11 +180,6 @@ pub extern "C" fn syna_image_size() -> usize {
     matcher::SIDE * matcher::SIDE
 }
 
-#[no_mangle]
-pub extern "C" fn syna_threshold() -> f64 {
-    matcher::THRESHOLD
-}
-
 /// One placement. Writes `syna_image_size()` pixels to `image` and returns
 /// SYNA_IMAGE, or returns SYNA_RETRY (the sensor rejected the placement),
 /// SYNA_CANCELLED or SYNA_ERROR. `on_status` reports when the sensor waits
@@ -209,56 +250,161 @@ fn trace(scan: &ScanOutcome) {
     }
 }
 
-/// Encodes `count` images of `syna_image_size()` pixels as a template. The
-/// C side frees the result with `syna_bytes_free`.
+/// Builds a template from `count` enroll-mode images of `syna_image_size()`
+/// pixels and stores it as finger `subtype` (WinBio position) of uid's user
+/// record on the sensor, creating the record if needed. Fills `out` and
+/// returns SYNA_OK, or SYNA_DATA_FULL or SYNA_ERROR. Blocks.
 /// # Safety
-/// `images` must hold `count * syna_image_size()` bytes and `len` must be writable.
+/// `handle` must come from `syna_open` and not be used concurrently, `images` must hold
+/// `count * syna_image_size()` bytes, `out` must be writable, and `error` must be NULL or
+/// point to a writable `char *`.
 #[no_mangle]
-pub unsafe extern "C" fn syna_template_encode(
+pub unsafe extern "C" fn syna_chip_enroll(
+    handle: *mut SynaHandle,
+    uid: u32,
+    subtype: u16,
     images: *const u8,
     count: usize,
-    len: *mut usize,
-) -> *mut u8 {
-    guard(ptr::null_mut(), ptr::null_mut(), || {
+    out: *mut SynaPrint,
+    error: *mut *mut c_char,
+) -> c_int {
+    guard(error, SYNA_ERROR, || {
+        // SAFETY: the C side passes the handle from syna_open, used by one thread at a time
+        let handle = unsafe { handle.as_mut() }.context("the device is not open")?;
         let size = syna_image_size();
         // SAFETY: the C side passes count images back to back
         let images = unsafe { slice::from_raw_parts(images, count * size) };
-        let template = Template {
-            images: images.chunks_exact(size).map(<[u8]>::to_vec).collect(),
-        };
-        let bytes = template.to_bytes().into_boxed_slice();
-        // SAFETY: the C side passes a valid pointer
-        unsafe { *len = bytes.len() };
-        Ok(Box::into_raw(bytes).cast())
+        let frames = images
+            .chunks_exact(size)
+            .map(moh::extract)
+            .collect::<Result<Vec<_>>>()?;
+        let scanner = &mut handle.scanner;
+        match chip::enroll(&mut scanner.session, &scanner.sensor, uid, subtype, &frames) {
+            Ok(stored) => {
+                // SAFETY: the C side passes a writable SynaPrint
+                unsafe { *out = stored.into() };
+                Ok(SYNA_OK)
+            }
+            Err(e) if e.is::<DataFull>() => Ok(SYNA_DATA_FULL),
+            Err(e) => Err(e),
+        }
+    })
+}
+
+/// One identify-mode touch, matched by the chip against user record `user`
+/// (0 = every user). Returns SYNA_MATCH with the matched user record and
+/// finger subtype in `out`, SYNA_NO_MATCH, SYNA_RETRY (the
+/// sensor rejected the placement), SYNA_CANCELLED or SYNA_ERROR. `on_status`
+/// reports when the sensor waits for a finger and when one is down. Blocks.
+/// # Safety
+/// As for `syna_capture`; `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn syna_chip_identify(
+    handle: *mut SynaHandle,
+    user: u16,
+    is_cancelled: CancelledFn,
+    on_status: StatusFn,
+    status_user: *mut c_void,
+    out: *mut SynaMatch,
+    error: *mut *mut c_char,
+) -> c_int {
+    guard(error, SYNA_ERROR, || {
+        // SAFETY: the C side passes the handle from syna_open, used by one thread at a time
+        let handle = unsafe { handle.as_mut() }.context("the device is not open")?;
+        let cancelled = || is_cancelled(status_user) != 0;
+        let outcome = handle.scanner.scan(
+            calibrate::Mode::Identify,
+            FINGER_TIMEOUT,
+            &cancelled,
+            || on_status(status_user, SYNA_STATUS_NEEDED),
+            || on_status(status_user, SYNA_STATUS_PRESENT),
+        );
+        trace(&outcome);
+        match outcome.result {
+            Ok(Scan::Image(_)) => {}
+            Ok(Scan::Rejected(_)) => return Ok(SYNA_RETRY),
+            Err(_) if cancelled() => return Ok(SYNA_CANCELLED),
+            Err(e) => return Err(e),
+        }
+        let scanner = &mut handle.scanner;
+        let decision = chip::chip_match(&mut scanner.session, &scanner.sensor, user)?;
+        Ok(match decision.result {
+            Some(result) => {
+                // SAFETY: the C side passes a writable SynaMatch
+                unsafe {
+                    *out = SynaMatch {
+                        user: result.user,
+                        subtype: result.subtype,
+                    }
+                };
+                SYNA_MATCH
+            }
+            None => SYNA_NO_MATCH,
+        })
+    })
+}
+
+/// The fingers stored under Linux-owned user records. On SYNA_OK, `*out`
+/// holds `*len` prints, which the C side frees with `syna_prints_free`.
+/// # Safety
+/// `handle` must come from `syna_open` and not be used concurrently, `out` and `len`
+/// must be writable, and `error` must be NULL or point to a writable `char *`.
+#[no_mangle]
+pub unsafe extern "C" fn syna_chip_list(
+    handle: *mut SynaHandle,
+    out: *mut *mut SynaPrint,
+    len: *mut usize,
+    error: *mut *mut c_char,
+) -> c_int {
+    guard(error, SYNA_ERROR, || {
+        // SAFETY: the C side passes the handle from syna_open, used by one thread at a time
+        let handle = unsafe { handle.as_mut() }.context("the device is not open")?;
+        let scanner = &mut handle.scanner;
+        let prints: Box<[SynaPrint]> = chip::list(&mut scanner.session, &scanner.sensor)?
+            .into_iter()
+            .map(SynaPrint::from)
+            .collect();
+        // SAFETY: the C side passes writable out-parameters
+        unsafe {
+            *len = prints.len();
+            *out = Box::into_raw(prints).cast();
+        }
+        Ok(SYNA_OK)
     })
 }
 
 /// # Safety
-/// `bytes`/`len` must come from `syna_template_encode`, freed once.
+/// `prints`/`len` must come from `syna_chip_list`, freed once.
 #[no_mangle]
-pub unsafe extern "C" fn syna_bytes_free(bytes: *mut u8, len: usize) {
-    if !bytes.is_null() {
-        // SAFETY: allocated by syna_template_encode with this length
-        drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(bytes, len)) });
+pub unsafe extern "C" fn syna_prints_free(prints: *mut SynaPrint, len: usize) {
+    if !prints.is_null() {
+        // SAFETY: allocated by syna_chip_list with this length
+        drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(prints, len)) });
     }
 }
 
-/// Matcher score of `image` against a template; NAN if the template is bad.
-/// Compare with `syna_threshold()`. Takes a few hundred milliseconds.
+/// Deletes a stored finger (and its user record once empty) after checking
+/// that it is still there and Linux-owned. Returns SYNA_OK, SYNA_NOT_FOUND or
+/// SYNA_ERROR. Blocks.
 /// # Safety
-/// `template` must hold `len` bytes, `image` `syna_image_size()` bytes, and `error`
-/// must be NULL or point to a writable `char *`.
+/// `handle` must come from `syna_open` and not be used concurrently, `print` must be
+/// readable, and `error` must be NULL or point to a writable `char *`.
 #[no_mangle]
-pub unsafe extern "C" fn syna_match(
-    template: *const u8,
-    len: usize,
-    image: *const u8,
+pub unsafe extern "C" fn syna_chip_delete(
+    handle: *mut SynaHandle,
+    print: *const SynaPrint,
     error: *mut *mut c_char,
-) -> f64 {
-    guard(error, f64::NAN, || {
-        // SAFETY: the C side passes the stored template bytes and one image
-        let template = Template::from_bytes(unsafe { slice::from_raw_parts(template, len) })?;
-        let image = unsafe { slice::from_raw_parts(image, syna_image_size()) };
-        Ok(Matcher::new(&template).score(image))
+) -> c_int {
+    guard(error, SYNA_ERROR, || {
+        // SAFETY: the C side passes the handle from syna_open, used by one thread at a time
+        let handle = unsafe { handle.as_mut() }.context("the device is not open")?;
+        // SAFETY: the C side passes a readable SynaPrint
+        let print = Stored::from(unsafe { *print });
+        let scanner = &mut handle.scanner;
+        match chip::delete(&mut scanner.session, &scanner.sensor, &print) {
+            Ok(()) => Ok(SYNA_OK),
+            Err(e) if e.is::<NotFound>() => Ok(SYNA_NOT_FOUND),
+            Err(e) => Err(e),
+        }
     })
 }
