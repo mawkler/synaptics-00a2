@@ -607,7 +607,9 @@ list_done (GObject *source, GAsyncResult *result, gpointer user_data)
       fp_print_set_finger (print, finger_for_subtype (listing->prints[i].subtype));
       if (getpwuid_r (listing->prints[i].uid, &entry, buffer, sizeof buffer, &found) == 0 && found)
         fp_print_set_username (print, found->pw_name);
-      g_ptr_array_add (prints, print);
+      /* FpPrint starts floating: without the sink, a caller that sinks it
+       * (PyGObject) loses it when the array is freed */
+      g_ptr_array_add (prints, g_object_ref_sink (print));
     }
   listing_free (listing);
   fpi_device_list_complete (device, prints, NULL);

@@ -235,7 +235,7 @@ def main():
         elif args.command in ('verify', 'identify'):
             report['results'] = attempts(dev, load_prints(), args.command, args.attempts)
             event('summary', attempts=len(report['results']),
-                  matched=sum(1 for r in report['results'] if r not in (False, None)), results=report['results'])
+                  matched=sum(1 for r in report['results'] if r is not False and r is not None), results=report['results'])
 
         elif args.command == 'cancel':
             prints = load_prints()
