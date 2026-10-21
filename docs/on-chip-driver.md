@@ -168,6 +168,14 @@ Before running fprintd against the module, note that the test users created
 by hand (uids 90001–90003, records 14, 15, 18) are Linux-owned by the SID
 rule, so `list` reports their fingers, and fprintd may delete them.
 
+Delete (open question 4) answered on 2026-10-21 (runs 83d7c562, ff10b496):
+`0x48` alone, then `0x1a`, removed finger record 16 and the emptied user
+record 14; a fresh session confirms it. No `db_write_enable` needed. The
+space is not reclaimed: `used` dropped by 23552 B, `free` stayed at 265472 B
+and the record count went up by 2, so the flash database is append-only until
+compacted, and the compaction command is unknown. Deleting therefore never
+makes room for a new template; `DATA_FULL` will need compaction.
+
 ## Implementation steps (after questions 1 to 4)
 
 1. Library `chip` module:
