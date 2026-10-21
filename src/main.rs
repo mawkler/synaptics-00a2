@@ -187,6 +187,11 @@ enum Command {
         /// Where to write the JSON report (mode 0600)
         #[arg(long)]
         output: PathBuf,
+        /// Keep only the first N records of each section, N from the
+        /// envelope's per-section header values (a test of whether the chip
+        /// reads them as counts)
+        #[arg(long)]
+        counts: bool,
     },
     /// Offline: descriptor-consistent agreement (see `pose::register`) between
     /// every pair of frame groups in a manifest, same group included. Prints
@@ -385,7 +390,8 @@ fn main() -> Result<()> {
             envelopes,
             images,
             output,
-        } => probe_score(&envelopes, &images, &output),
+            counts,
+        } => probe_score(&envelopes, &images, &output, counts),
         Command::ChipNewUser {
             serial_file,
             uid,
@@ -1305,7 +1311,12 @@ fn chip_template(
     )
 }
 
-fn probe_score(envelopes: &[PathBuf], images: &[PathBuf], output: &Path) -> Result<()> {
+fn probe_score(
+    envelopes: &[PathBuf],
+    images: &[PathBuf],
+    output: &Path,
+    counts: bool,
+) -> Result<()> {
     let name = |p: &PathBuf| {
         p.file_name()
             .unwrap_or_default()
@@ -1316,7 +1327,13 @@ fn probe_score(envelopes: &[PathBuf], images: &[PathBuf], output: &Path) -> Resu
         .iter()
         .map(|p| {
             let data = fs::read(p).with_context(|| format!("reading {}", p.display()))?;
-            Ok((name(p), moh::sections(&data)?))
+            let mut sections = moh::sections(&data)?;
+            if counts {
+                for (s, n) in sections.iter_mut().zip(moh::section_counts(&data)?) {
+                    s.truncate(n as usize);
+                }
+            }
+            Ok((name(p), sections))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut rows = Vec::new();

@@ -700,6 +700,21 @@ pub fn assemble_with(sections: &[&[Keypoint]], subtype: u16, poses: Option<&[Pos
     envelope(subtype, &ws)
 }
 
+/// The per-section values of the header's u32 table (offset 24): 76, 90, 86,
+/// 89 in the Windows scaffold. Whether the chip reads them as a record count
+/// is being tested.
+pub fn section_counts(envelope: &[u8]) -> Result<[u32; 4]> {
+    ensure!(
+        envelope.len() == ENVELOPE_SIZE,
+        "a MoH envelope is {ENVELOPE_SIZE} bytes, not {}",
+        envelope.len()
+    );
+    let ws = &envelope[12..12 + WS_SIZE];
+    Ok(std::array::from_fn(|k| {
+        u32::from_le_bytes(ws[24 + 4 * k..28 + 4 * k].try_into().expect("4 bytes"))
+    }))
+}
+
 /// The keypoints of each of an envelope's four sections (descriptor, x, y;
 /// the orientation isn't stored), without the zero-filled unused records
 pub fn sections(envelope: &[u8]) -> Result<Vec<Vec<Keypoint>>> {
