@@ -173,8 +173,20 @@ Delete (open question 4) answered on 2026-10-21 (runs 83d7c562, ff10b496):
 record 14; a fresh session confirms it. No `db_write_enable` needed. The
 space is not reclaimed: `used` dropped by 23552 B, `free` stayed at 265472 B
 and the record count went up by 2, so the flash database is append-only until
-compacted, and the compaction command is unknown. Deleting therefore never
-makes room for a new template; `DATA_FULL` will need compaction.
+compacted, and the compaction command is unknown. Deleting therefore makes
+no room by itself.
+
+No compaction command exists on the host side (2026-10-21, offline): the
+Windows driver's firmware-command table (`synaWudfBioUsb.dll`, 57 entries at VA
+0x180113588, file `scsFwV4.c`) has, for the database, 0x45 info, 0x46
+children, 0x47 new record, 0x48 delete, 0x49 value, 0x4a user, 0x4b user
+storage and three unknowns, 0x4c (u32 length, u16, data), 0x4d (u16 length,
+data) and 0x4e (two length-prefixed blobs); all carry data, so none looks
+like a compaction. The DLL's strings have no "compact", "defrag", "garbage"
+or "reclaim". Most likely the firmware compacts by itself when a write needs
+room, or never; which one is unverified. Until it is known, budget the
+265 KB free (about 11 templates) and stop before it runs out: the only known
+reset, erasing partition 4, would also remove the Windows user's record.
 
 ## Implementation steps (after questions 1 to 4)
 

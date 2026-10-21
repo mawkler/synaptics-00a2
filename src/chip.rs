@@ -167,7 +167,10 @@ fn new_dbid(payload: &[u8]) -> Result<u16> {
 /// commit, which answers "nothing to commit" if 0x48 needs none. Verified
 /// 2026-10-21 (run 83d7c562): the record is gone in a fresh session. The
 /// space is not freed: `free` stays put until the flash is compacted.
-/// shortcut: no compaction, so deletes never make room; find the command before the database fills
+/// The Windows driver has no compaction command either (its firmware-command
+/// table, `synaWudfBioUsb.dll` 0x180113588, has none), so the firmware may
+/// compact by itself when a write needs room. Unverified.
+/// shortcut: deletes may never make room; watch `free` and stop testing before the database fills
 fn delete_record(session: &mut Session, sensor: &Sensor, dbid: u16) -> Result<()> {
     let response = session.cmd(sensor, &db::delete_request(dbid))?;
     let commit = session.cmd(sensor, &db::COMMIT_REQUEST)?;
