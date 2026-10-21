@@ -185,8 +185,12 @@ data) and 0x4e (two length-prefixed blobs); all carry data, so none looks
 like a compaction. The DLL's strings have no "compact", "defrag", "garbage"
 or "reclaim". Most likely the firmware compacts by itself when a write needs
 room, or never; which one is unverified. Until it is known, budget the
-265 KB free (about 11 templates) and stop before it runs out: the only known
-reset, erasing partition 4, would also remove the Windows user's record.
+265 KB free (about 11 templates). The fallback is a full reset of the
+template database (the owner has no Windows any more, so its records may go):
+python-validity erases partition 4 (`db_write_enable`, `3f 04`, `1a`) and then
+recreates the user storage (`new_record(1, 4, 3, "StgWindsor\0")`). Unverified on
+this sensor; it leaves the pairing (partition 1) and calibration (partition 6)
+alone.
 
 ## Implementation steps (after questions 1 to 4)
 
