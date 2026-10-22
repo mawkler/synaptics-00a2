@@ -10,7 +10,7 @@ use std::{
     io::Write,
     panic::{catch_unwind, AssertUnwindSafe},
     ptr, slice,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{ensure, Context, Result};
@@ -70,8 +70,15 @@ const FINGER_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 pub type CancelledFn = extern "C" fn(*mut c_void) -> c_int;
 pub type StatusFn = extern "C" fn(*mut c_void, c_int);
 
+/// A match this soon after a miss refreshes the matched finger's templates
+/// (see `chip::refresh`): a miss then a match is the finger reading
+/// differently from what is stored, and the matching touch shows how it reads
+/// now
+const REFRESH_AFTER_MISS: Duration = Duration::from_secs(120);
+
 pub struct SynaHandle {
     scanner: Scanner,
+    last_miss: Option<Instant>,
 }
 
 extern "C" {
@@ -148,7 +155,10 @@ pub unsafe extern "C" fn syna_open(
         let keys = host_keys()?;
         let sensor = usb::Sensor::open_at(bus, address)?;
         let scanner = Scanner::open(sensor, &keys, &mut |_, _| {})?;
-        Ok(Box::into_raw(Box::new(SynaHandle { scanner })))
+        Ok(Box::into_raw(Box::new(SynaHandle {
+            scanner,
+            last_miss: None,
+        })))
     })
 }
 
@@ -308,24 +318,35 @@ pub unsafe extern "C" fn syna_chip_identify(
             || on_status(status_user, SYNA_STATUS_PRESENT),
         );
         trace(&outcome);
-        match outcome.result {
-            Ok(Scan::Image(_)) => {}
+        let image = match outcome.result {
+            Ok(Scan::Image(image)) => image,
             Ok(Scan::Rejected(_)) => return Ok(SYNA_RETRY),
             Err(_) if cancelled() => return Ok(SYNA_CANCELLED),
             Err(e) => return Err(e),
-        }
+        };
         let scanner = &mut handle.scanner;
         let uid = u32::try_from(restrict_uid).ok();
-        Ok(
-            match chip::identify(&mut scanner.session, &scanner.sensor, uid)? {
-                Some(print) => {
-                    // SAFETY: the C side passes a writable SynaPrint
-                    unsafe { *out = print.into() };
-                    SYNA_MATCH
-                }
-                None => SYNA_NO_MATCH,
-            },
-        )
+        let Some(print) = chip::identify(&mut scanner.session, &scanner.sensor, uid)? else {
+            handle.last_miss = Some(Instant::now());
+            return Ok(SYNA_NO_MATCH);
+        };
+        if handle
+            .last_miss
+            .take()
+            .is_some_and(|miss| miss.elapsed() < REFRESH_AFTER_MISS)
+        {
+            // Never fails the match: the refresh is a side effect
+            match chip::refresh(&mut scanner.session, &scanner.sensor, &print, &image.pixels) {
+                Ok(subtype) => eprintln!(
+                    "syna_00a2: refreshed uid {} as subtype {subtype:#x}",
+                    print.uid
+                ),
+                Err(e) => eprintln!("syna_00a2: refresh skipped: {e:#}"),
+            }
+        }
+        // SAFETY: the C side passes a writable SynaPrint
+        unsafe { *out = print.into() };
+        Ok(SYNA_MATCH)
     })
 }
 

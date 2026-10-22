@@ -207,6 +207,23 @@ hand-made test users without an account) is gone afterwards. Templates live
 only in memory during this; a failure after the erase means enrolling again.
 `--check` runs only the read-back. Not yet run on the sensor.
 
+## Refreshing templates from logins (2026-10-22, offline; premise untested)
+
+Cross-day tests: a template matches its own day's touches (10/10) but only
+about 25 % the next day, while the next day's touches resemble the previous
+day's *login* touches strongly (median 30 descriptor-consistent candidates
+against 5 for the enrollment captures). So the driver keeps up to
+`chip::RECENT_SLOTS` (3) recent templates per finger besides the enrolled one:
+subtype = finger position + 0x10 × slot. When a match comes within 2 minutes
+of a miss (the finger reads differently from what is stored), the matching
+touch becomes a single-frame template in a free slot, or replaces the oldest
+(lowest record id). It needs a strong touch (≥ 250 keypoints), compacts first
+if space is short, and never fails the match. List, delete, re-enroll and
+matching treat all of a finger's slots as one print. Nothing is kept on the
+host. Untested on the sensor: that a template built from identify-mode
+touches matches at all (D, the only one tried, was tested on a day nothing
+matched), and that subtypes above 0x0f are accepted.
+
 ## Implementation steps (after questions 1 to 4)
 
 1. Library `chip` module:

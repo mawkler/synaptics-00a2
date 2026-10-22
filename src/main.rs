@@ -167,8 +167,15 @@ enum Command {
         envelope: PathBuf,
         /// Existing user record to file the finger under. python-validity: the
         /// chip's matcher never finds a finger under a user that doesn't exist.
+        #[arg(
+            long,
+            required_unless_present = "parent_uid",
+            conflicts_with = "parent_uid"
+        )]
+        parent: Option<u16>,
+        /// Or the Linux uid whose user record (found by its SID) to use
         #[arg(long)]
-        parent: u16,
+        parent_uid: Option<u32>,
         /// The envelope's SHA-256, as shown when the write was approved
         #[arg(long)]
         confirm: String,
@@ -558,6 +565,7 @@ fn main() -> Result<()> {
             serial_file,
             envelope,
             parent,
+            parent_uid,
             confirm,
             output,
         } => {
@@ -575,7 +583,7 @@ fn main() -> Result<()> {
                 envelope.len()
             );
             with_sensor(&serial_file, output, |sensor, keys, steps| {
-                run_chip_enroll(sensor, keys, steps, &envelope, parent)
+                run_chip_enroll(sensor, keys, steps, &envelope, parent, parent_uid)
             })
         }
         Command::Db {
@@ -1010,9 +1018,16 @@ fn run_chip_enroll(
     keys: &pairing::HostKeys,
     steps: &mut Map<String, Value>,
     envelope: &[u8],
-    parent: u16,
+    parent: Option<u16>,
+    parent_uid: Option<u32>,
 ) -> Result<()> {
     let (mut session, _) = device::open_session(&sensor, keys, &mut log(steps))?;
+    let parent = match (parent, parent_uid) {
+        (Some(parent), _) => parent,
+        (None, Some(uid)) => chip::find_user(&mut session, &sensor, uid)?
+            .with_context(|| format!("uid {uid} has no user record; nothing was written"))?,
+        (None, None) => bail!("give --parent or --parent-uid; nothing was written"),
+    };
     // Checks first, all reads
     let before = db::parse_info(&session.cmd_ok(&sensor, &db::info_request())?)?;
     ensure!(

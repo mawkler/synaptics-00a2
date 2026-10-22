@@ -211,10 +211,46 @@ fn free_space(session: &mut Session, sensor: &Sensor) -> Result<u32> {
     Ok(db::parse_info(&session.cmd_ok(sensor, &db::info_request())?)?.free)
 }
 
+/// Recent-touch templates kept per finger besides the enrolled one (see
+/// [`refresh`]). A finger's templates share its WinBio position in the low
+/// nibble of their subtype; the enrolled one is slot 0, recent ones are slots
+/// 1..=RECENT_SLOTS (subtype + 0x10 × slot).
+pub const RECENT_SLOTS: u16 = 3;
+
+fn position(subtype: u16) -> u16 {
+    subtype & 0x0f
+}
+
+fn slot(subtype: u16) -> u16 {
+    subtype >> 4
+}
+
+/// The recent slot a new template goes into: a free one, else the one whose
+/// template is oldest (lowest record id: ids only grow, and compaction keeps
+/// their order). `taken` holds (slot, record id) of the finger's recent slots.
+fn next_slot(taken: &[(u16, u16)]) -> u16 {
+    (1..=RECENT_SLOTS)
+        .find(|s| taken.iter().all(|&(t, _)| t != *s))
+        .or_else(|| taken.iter().min_by_key(|&&(_, dbid)| dbid).map(|&(s, _)| s))
+        .unwrap_or(1)
+}
+
+/// Every template under a Linux-owned user record, recent slots included:
+/// (uid, user record, finger record)
+fn templates(session: &mut Session, sensor: &Sensor) -> Result<Vec<(u32, u16, db::Finger)>> {
+    let mut all = Vec::new();
+    for (user, _) in storage(session, sensor)?.users {
+        if let (Some(uid), fingers) = user_record(session, sensor, user)? {
+            all.extend(fingers.into_iter().map(|f| (uid, user, f)));
+        }
+    }
+    Ok(all)
+}
+
 /// Builds the template from enroll-mode frames and stores it as the finger
-/// `subtype` of uid's user record, creating the record on first use. A
-/// finger already stored there with the same subtype is the old copy of this
-/// finger, so it is replaced.
+/// `subtype` of uid's user record, creating the record on first use. Templates
+/// already stored for that finger (an old enrollment and its recent slots)
+/// are replaced.
 pub fn enroll(
     session: &mut Session,
     sensor: &Sensor,
@@ -232,7 +268,7 @@ pub fn enroll(
     }
     let user = user_for(session, sensor, uid)?;
     let (_, fingers) = user_record(session, sensor, user)?;
-    for old in fingers.iter().filter(|f| f.subtype == subtype) {
+    for old in fingers.iter().filter(|f| position(f.subtype) == subtype) {
         delete_record(session, sensor, old.dbid)?;
     }
     store(session, sensor, user, &envelope)?;
@@ -256,40 +292,85 @@ pub fn identify(session: &mut Session, sensor: &Sensor, uid: Option<u32>) -> Res
     let user = u16::try_from(result.user).context("matched user record id out of range")?;
     Ok(user_record(session, sensor, user)?.0.map(|uid| Print {
         uid,
-        subtype: result.subtype,
+        subtype: position(result.subtype),
     }))
 }
 
-/// Every finger under a Linux-owned user record
+/// Every finger under a Linux-owned user record, once per finger whatever
+/// recent slots it has
 pub fn list(session: &mut Session, sensor: &Sensor) -> Result<Vec<Print>> {
-    let mut prints = Vec::new();
-    for (user, _) in storage(session, sensor)?.users {
-        if let (Some(uid), fingers) = user_record(session, sensor, user)? {
-            prints.extend(fingers.iter().map(|f| Print {
-                uid,
-                subtype: f.subtype,
-            }));
+    let mut prints: Vec<Print> = Vec::new();
+    for (uid, _, finger) in templates(session, sensor)? {
+        let print = Print {
+            uid,
+            subtype: position(finger.subtype),
+        };
+        if !prints.contains(&print) {
+            prints.push(print);
         }
     }
     Ok(prints)
 }
 
-/// Deletes a stored finger; the user record goes too once it is empty.
-/// [`NotFound`] if the uid has no user record or no finger with that subtype.
+/// Deletes a stored finger with its recent slots; the user record goes too
+/// once it is empty. [`NotFound`] if the uid has no user record or no such
+/// finger.
 pub fn delete(session: &mut Session, sensor: &Sensor, print: &Print) -> Result<()> {
     let user = find_user(session, sensor, print.uid)?.ok_or(NotFound)?;
     let (_, fingers) = user_record(session, sensor, user)?;
-    let finger = fingers
+    let (finger, others): (Vec<_>, Vec<_>) = fingers
         .iter()
-        .find(|f| f.subtype == print.subtype)
-        .ok_or(NotFound)?;
-    delete_record(session, sensor, finger.dbid)?;
-    if fingers.len() == 1 {
+        .partition(|f| position(f.subtype) == print.subtype);
+    if finger.is_empty() {
+        return Err(NotFound.into());
+    }
+    for f in finger {
+        delete_record(session, sensor, f.dbid)?;
+    }
+    if others.is_empty() {
         delete_record(session, sensor, user)?;
     }
     Ok(())
 }
 
+/// Stores a template built from one identify-mode touch the chip just
+/// matched to `print`, in one of the finger's recent slots (see
+/// [`next_slot`]), so the stored templates follow how the finger reads
+/// lately. Compacts first if the database is short of space. Returns the
+/// subtype written.
+pub fn refresh(
+    session: &mut Session,
+    sensor: &Sensor,
+    print: &Print,
+    pixels: &[u8],
+) -> Result<u16> {
+    let frame = moh::extract(pixels)?;
+    ensure!(
+        frame.pool >= moh::FRAME_KP_CAP,
+        "the touch is too weak to keep ({} keypoints)",
+        frame.pool
+    );
+    if (free_space(session, sensor)? as usize) < moh::ENVELOPE_SIZE + 4096 {
+        compact(session, sensor)?;
+        ensure!(
+            free_space(session, sensor)? as usize >= moh::ENVELOPE_SIZE + 4096,
+            "no room for a recent template even after compacting"
+        );
+    }
+    let user = find_user(session, sensor, print.uid)?.ok_or(NotFound)?;
+    let (_, fingers) = user_record(session, sensor, user)?;
+    let taken: Vec<(u16, u16)> = fingers
+        .iter()
+        .filter(|f| position(f.subtype) == print.subtype && slot(f.subtype) >= 1)
+        .map(|f| (slot(f.subtype), f.dbid))
+        .collect();
+    let subtype = print.subtype | next_slot(&taken) << 4;
+    if let Some(old) = fingers.iter().find(|f| f.subtype == subtype) {
+        delete_record(session, sensor, old.dbid)?;
+    }
+    store(session, sensor, user, &moh::template(&[frame], subtype))?;
+    Ok(subtype)
+}
 /// `0x3f`, python-validity's `erase_flash`: erases one flash partition.
 /// Partition 4 holds the template database.
 const ERASE_TEMPLATE_PARTITION: [u8; 2] = [0x3f, 4];
@@ -306,17 +387,13 @@ pub struct Compacted {
 /// if one can't be read or doesn't check out
 pub fn saved_templates(session: &mut Session, sensor: &Sensor) -> Result<Vec<(Print, Vec<u8>)>> {
     let mut saved = Vec::new();
-    for (user, _) in storage(session, sensor)?.users {
-        if let (Some(uid), fingers) = user_record(session, sensor, user)? {
-            for finger in fingers {
-                let response = session.cmd_ok(sensor, &db::value_request(finger.dbid))?;
-                let (_, value) = db::parse_value(&response)?;
-                let envelope = moh::envelope_from_stored(finger.subtype, &value)
-                    .with_context(|| format!("finger record {}", finger.dbid))?;
-                let subtype = finger.subtype;
-                saved.push((Print { uid, subtype }, envelope));
-            }
-        }
+    for (uid, _, finger) in templates(session, sensor)? {
+        let response = session.cmd_ok(sensor, &db::value_request(finger.dbid))?;
+        let (_, value) = db::parse_value(&response)?;
+        let envelope = moh::envelope_from_stored(finger.subtype, &value)
+            .with_context(|| format!("finger record {}", finger.dbid))?;
+        let subtype = finger.subtype;
+        saved.push((Print { uid, subtype }, envelope));
     }
     Ok(saved)
 }
@@ -339,14 +416,41 @@ pub fn compact(session: &mut Session, sensor: &Sensor) -> Result<Compacted> {
         let user = user_for(session, sensor, print.uid)?;
         store(session, sensor, user, envelope)?;
     }
-    let kept = list(session, sensor)?;
+    let restored: Vec<Print> = templates(session, sensor)?
+        .into_iter()
+        .map(|(uid, _, f)| Print {
+            uid,
+            subtype: f.subtype,
+        })
+        .collect();
     ensure!(
-        saved.iter().all(|(print, _)| kept.contains(print)),
+        saved.iter().all(|(print, _)| restored.contains(print)),
         "not every template came back after the erase"
     );
     Ok(Compacted {
-        kept,
+        kept: restored,
         free_before,
         free_after: free_space(session, sensor)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slots_share_the_finger_position() {
+        assert_eq!((position(0x03), slot(0x03)), (3, 0));
+        assert_eq!((position(0x23), slot(0x23)), (3, 2));
+        assert_eq!((position(0x3a), slot(0x3a)), (10, 3));
+    }
+
+    #[test]
+    fn recent_slots_fill_up_then_rotate_oldest_first() {
+        assert_eq!(next_slot(&[]), 1);
+        assert_eq!(next_slot(&[(1, 30)]), 2);
+        assert_eq!(next_slot(&[(1, 30), (3, 31)]), 2);
+        // All taken: the lowest record id is the oldest
+        assert_eq!(next_slot(&[(1, 40), (2, 35), (3, 38)]), 2);
+    }
 }
