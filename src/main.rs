@@ -254,13 +254,14 @@ enum Command {
         /// Linux uid in the user record's SID
         #[arg(long)]
         uid: u32,
-        /// The finger's subtype
+        /// The finger position (1..=10, e.g. 3 = right middle); every template
+        /// of that finger (its recent slots too) goes
         #[arg(long, value_parser = parse_u16)]
         subtype: u16,
         /// Print the requests, send nothing
         #[arg(long)]
         dry_run: bool,
-        /// The subtype again, as approved
+        /// The position again, as approved
         #[arg(long, value_parser = parse_u16)]
         confirm: Option<u16>,
         /// Also write the JSON report here (mode 0600)
@@ -464,6 +465,11 @@ fn main() -> Result<()> {
             confirm,
             output,
         } => {
+            ensure!(
+                (1..=10).contains(&subtype),
+                "--subtype is the finger position, 1..=10 (a slot template's {subtype:#x} is position {}); nothing was sent",
+                subtype & 0x0f
+            );
             let print = chip::Print { uid, subtype };
             if dry_run {
                 return report(
