@@ -228,20 +228,28 @@ pub unsafe extern "C" fn syna_capture(
 /// Appends one JSON line per scan to the file named by SYNA_00A2_TRACE, for
 /// diagnosing scans that stall. Off unless the variable is set (tests only).
 fn trace(scan: &ScanOutcome) {
-    let Some(path) = std::env::var_os("SYNA_00A2_TRACE") else {
+    if std::env::var_os("SYNA_00A2_TRACE").is_none() {
         return;
-    };
+    }
     let outcome = match &scan.result {
         Ok(Scan::Image(_)) => "image".to_owned(),
         Ok(Scan::Rejected(code)) => format!("rejected {code:#x}"),
         Err(e) => format!("error: {e:#}"),
     };
-    let line = serde_json::json!({
+    note(serde_json::json!({
         "outcome": outcome,
         "events": scan.events,
         "stale": scan.stale,
         "stalled": scan.stalled,
-    });
+    }));
+}
+
+/// Appends one JSON line to the file named by SYNA_00A2_TRACE (test runs
+/// only; off unless the variable is set)
+fn note(line: serde_json::Value) {
+    let Some(path) = std::env::var_os("SYNA_00A2_TRACE") else {
+        return;
+    };
     let file = fs::OpenOptions::new().create(true).append(true).open(path);
     if let Ok(mut file) = file {
         let _ = writeln!(file, "{line}");
@@ -326,10 +334,13 @@ pub unsafe extern "C" fn syna_chip_identify(
         };
         let scanner = &mut handle.scanner;
         let uid = u32::try_from(restrict_uid).ok();
-        let Some(print) = chip::identify(&mut scanner.session, &scanner.sensor, uid)? else {
+        let Some((print, matched)) = chip::identify(&mut scanner.session, &scanner.sensor, uid)?
+        else {
             handle.last_miss = Some(Instant::now());
+            note(serde_json::json!({ "match": null }));
             return Ok(SYNA_NO_MATCH);
         };
+        note(serde_json::json!({ "match": format!("{matched:#x}") }));
         if handle
             .last_miss
             .take()
@@ -337,11 +348,17 @@ pub unsafe extern "C" fn syna_chip_identify(
         {
             // Never fails the match: the refresh is a side effect
             match chip::refresh(&mut scanner.session, &scanner.sensor, &print, &image.pixels) {
-                Ok(subtype) => eprintln!(
-                    "syna_00a2: refreshed uid {} as subtype {subtype:#x}",
-                    print.uid
-                ),
-                Err(e) => eprintln!("syna_00a2: refresh skipped: {e:#}"),
+                Ok(subtype) => {
+                    eprintln!(
+                        "syna_00a2: refreshed uid {} as subtype {subtype:#x}",
+                        print.uid
+                    );
+                    note(serde_json::json!({ "refreshed": format!("{subtype:#x}") }));
+                }
+                Err(e) => {
+                    eprintln!("syna_00a2: refresh skipped: {e:#}");
+                    note(serde_json::json!({ "refresh_skipped": format!("{e:#}") }));
+                }
             }
         }
         // SAFETY: the C side passes a writable SynaPrint
