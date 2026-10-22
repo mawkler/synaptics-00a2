@@ -17,7 +17,7 @@ use anyhow::{ensure, Context, Result};
 use syna_00a2::{
     calibrate,
     capture::Scan,
-    chip::{self, DataFull, NotFound, Stored},
+    chip::{self, DataFull, NotFound, Print},
     device::{self, ScanOutcome, Scanner},
     matcher, moh,
     pairing::HostKeys,
@@ -34,40 +34,28 @@ pub const SYNA_NOT_FOUND: c_int = 6;
 pub const SYNA_OK: c_int = 0;
 pub const SYNA_ERROR: c_int = -1;
 
-/// A finger stored on the sensor, as the C side keeps it in the print
+/// A finger stored on the sensor, as the C side keeps it in the print:
+/// the Linux uid and the WinBio finger position
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SynaPrint {
     pub uid: u32,
-    pub user: u16,
-    pub finger: u16,
     pub subtype: u16,
 }
 
-/// The chip's match: user record and finger subtype
-#[repr(C)]
-pub struct SynaMatch {
-    pub user: u32,
-    pub subtype: u16,
-}
-
-impl From<Stored> for SynaPrint {
-    fn from(s: Stored) -> Self {
+impl From<Print> for SynaPrint {
+    fn from(p: Print) -> Self {
         Self {
-            uid: s.uid,
-            user: s.user,
-            finger: s.finger,
-            subtype: s.subtype,
+            uid: p.uid,
+            subtype: p.subtype,
         }
     }
 }
 
-impl From<SynaPrint> for Stored {
+impl From<SynaPrint> for Print {
     fn from(p: SynaPrint) -> Self {
         Self {
             uid: p.uid,
-            user: p.user,
-            finger: p.finger,
             subtype: p.subtype,
         }
     }
@@ -291,21 +279,21 @@ pub unsafe extern "C" fn syna_chip_enroll(
     })
 }
 
-/// One identify-mode touch, matched by the chip against user record `user`
-/// (0 = every user). Returns SYNA_MATCH with the matched user record and
-/// finger subtype in `out`, SYNA_NO_MATCH, SYNA_RETRY (the
-/// sensor rejected the placement), SYNA_CANCELLED or SYNA_ERROR. `on_status`
-/// reports when the sensor waits for a finger and when one is down. Blocks.
+/// One identify-mode touch, matched by the chip against uid `restrict_uid`'s
+/// fingers (any Linux user's when negative). Returns SYNA_MATCH with the
+/// matched print in `out`, SYNA_NO_MATCH, SYNA_RETRY (the sensor rejected the
+/// placement), SYNA_CANCELLED or SYNA_ERROR. `on_status` reports when the
+/// sensor waits for a finger and when one is down. Blocks.
 /// # Safety
 /// As for `syna_capture`; `out` must be writable.
 #[no_mangle]
 pub unsafe extern "C" fn syna_chip_identify(
     handle: *mut SynaHandle,
-    user: u16,
+    restrict_uid: i64,
     is_cancelled: CancelledFn,
     on_status: StatusFn,
     status_user: *mut c_void,
-    out: *mut SynaMatch,
+    out: *mut SynaPrint,
     error: *mut *mut c_char,
 ) -> c_int {
     guard(error, SYNA_ERROR, || {
@@ -327,20 +315,17 @@ pub unsafe extern "C" fn syna_chip_identify(
             Err(e) => return Err(e),
         }
         let scanner = &mut handle.scanner;
-        let decision = chip::chip_match(&mut scanner.session, &scanner.sensor, user)?;
-        Ok(match decision.result {
-            Some(result) => {
-                // SAFETY: the C side passes a writable SynaMatch
-                unsafe {
-                    *out = SynaMatch {
-                        user: result.user,
-                        subtype: result.subtype,
-                    }
-                };
-                SYNA_MATCH
-            }
-            None => SYNA_NO_MATCH,
-        })
+        let uid = u32::try_from(restrict_uid).ok();
+        Ok(
+            match chip::identify(&mut scanner.session, &scanner.sensor, uid)? {
+                Some(print) => {
+                    // SAFETY: the C side passes a writable SynaPrint
+                    unsafe { *out = print.into() };
+                    SYNA_MATCH
+                }
+                None => SYNA_NO_MATCH,
+            },
+        )
     })
 }
 
@@ -383,9 +368,8 @@ pub unsafe extern "C" fn syna_prints_free(prints: *mut SynaPrint, len: usize) {
     }
 }
 
-/// Deletes a stored finger (and its user record once empty) after checking
-/// that it is still there and Linux-owned. Returns SYNA_OK, SYNA_NOT_FOUND or
-/// SYNA_ERROR. Blocks.
+/// Deletes a stored finger (and its user record once empty). Returns
+/// SYNA_OK, SYNA_NOT_FOUND or SYNA_ERROR. Blocks.
 /// # Safety
 /// `handle` must come from `syna_open` and not be used concurrently, `print` must be
 /// readable, and `error` must be NULL or point to a writable `char *`.
@@ -399,7 +383,7 @@ pub unsafe extern "C" fn syna_chip_delete(
         // SAFETY: the C side passes the handle from syna_open, used by one thread at a time
         let handle = unsafe { handle.as_mut() }.context("the device is not open")?;
         // SAFETY: the C side passes a readable SynaPrint
-        let print = Stored::from(unsafe { *print });
+        let print = Print::from(unsafe { *print });
         let scanner = &mut handle.scanner;
         match chip::delete(&mut scanner.session, &scanner.sensor, &print) {
             Ok(()) => Ok(SYNA_OK),

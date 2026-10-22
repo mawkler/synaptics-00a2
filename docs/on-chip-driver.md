@@ -74,10 +74,11 @@ same user. `clear_storage` stays unimplemented.
 ## Prints
 
 - `FPI_PRINT_RAW`, `fpi_print_set_device_stored (TRUE)`. The fpi-data is a
-  GVariant `(uqqq)`: the Linux uid, the user record, the finger record and
-  the subtype. No TID: the chip refuses a second finger with the same subtype
-  under one user (`0x04c3`), and the match result carries the user record and
-  subtype, so (user record, subtype) names exactly one finger.
+  GVariant `(uq)`: the Linux uid and the subtype. That pair names exactly one
+  finger: a uid has one user record (found by its SID), and the chip refuses a
+  second finger with the same subtype under one user (`0x04c3`). No record ids
+  and no TID, so prints stay valid when compaction rebuilds the database; a
+  match result's user record is mapped back to its uid.
 - `fp_print_equal` compares the type, driver, device id and `g_variant_equal`
   of that data. Every field can be read back from the chip, so `list` rebuilds
   prints that compare equal to the enrolled ones.
@@ -191,6 +192,20 @@ python-validity erases partition 4 (`db_write_enable`, `3f 04`, `1a`) and then
 recreates the user storage (`new_record(1, 4, 3, "StgWindsor\0")`). Unverified on
 this sensor; it leaves the pairing (partition 1) and calibration (partition 6)
 alone.
+
+## Compaction (2026-10-22, offline only so far)
+
+Deletes free no space, not even across a sensor power cycle (2026-10-21
+suspend; free stayed at the running total). `chip::compact` (CLI
+`chip-compact`) reclaims it: it reads every Linux-owned finger record back
+(`0x49`) and rebuilds each envelope from the record value, checking the
+TemplateId against the body (`moh::envelope_from_stored`), all before any
+write; then erases partition 4 (`db_write_enable`, `3f 04`, `1a`), recreates
+StgWindsor if it is gone (`47 0100 0400 0300 0b00` + `StgWindsor\0`), and stores
+each Linux user and template again. Everything else (the Windows user, the
+hand-made test users without an account) is gone afterwards. Templates live
+only in memory during this; a failure after the erase means enrolling again.
+`--check` runs only the read-back. Not yet run on the sensor.
 
 ## Implementation steps (after questions 1 to 4)
 

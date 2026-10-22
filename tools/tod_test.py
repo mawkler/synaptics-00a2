@@ -6,7 +6,8 @@
     enroll --out PRINT [--finger F]        10 touch-and-lift placements; the
                                            template goes onto the sensor (a
                                            database write) under your user
-    list                                   the prints stored on the sensor
+    list [--out PRINT]                     the prints stored on the sensor;
+                                           --out saves your own (first) one
     delete --print PRINT                   delete one stored print (a write)
     verify --print PRINT --attempts N      N attempts against one print
     identify --print PRINT... --attempts N N attempts against several
@@ -46,7 +47,7 @@ def main():
     p = sub.add_parser('enroll')
     p.add_argument('--out', required=True)
     p.add_argument('--finger', default='right-middle', help='e.g. right-middle, left-index')
-    sub.add_parser('list')
+    sub.add_parser('list').add_argument('--out')
     sub.add_parser('delete').add_argument('--print', required=True, dest='prints', type=lambda v: [v])
     for name in ('verify', 'identify'):
         p = sub.add_parser(name)
@@ -227,6 +228,13 @@ def main():
             prints = dev.list_prints_sync()
             report['results'] = [{'finger': p.get_finger().value_nick, 'username': p.get_username()} for p in prints]
             event('listed', prints=report['results'])
+            mine = [p for p in prints if p.get_username() == getpass.getuser()]
+            if args.out and mine:
+                data = bytes(mine[0].serialize())
+                fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                os.write(fd, data)
+                os.close(fd)
+                event('saved', finger=mine[0].get_finger().value_nick, file=args.out)
 
         elif args.command == 'delete':
             dev.delete_print_sync(load_prints()[0])

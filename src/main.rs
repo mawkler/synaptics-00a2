@@ -231,11 +231,11 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// DATABASE WRITE. Deletes one finger record the way the driver does
-    /// (`chip::delete`): only if its user record is Linux uid's and holds that
-    /// finger; the user record goes too once it is empty. `--dry-run` prints
-    /// the requests without opening the sensor. A real run needs `--confirm`
-    /// to repeat `--finger`.
+    /// DATABASE WRITE. Deletes one finger the way the driver does
+    /// (`chip::delete`): uid's user record's finger with that subtype; the
+    /// user record goes too once it is empty. `--dry-run` prints what would be
+    /// sent without opening the sensor. A real run needs `--confirm` to repeat
+    /// `--subtype`.
     ChipDelete {
         /// File holding the DMI product serial (root-only in sysfs)
         #[arg(long)]
@@ -243,21 +243,39 @@ enum Command {
         /// Linux uid in the user record's SID
         #[arg(long)]
         uid: u32,
-        /// The user record
-        #[arg(long)]
-        user: u16,
-        /// The finger record
-        #[arg(long)]
-        finger: u16,
         /// The finger's subtype
         #[arg(long, value_parser = parse_u16)]
         subtype: u16,
         /// Print the requests, send nothing
         #[arg(long)]
         dry_run: bool,
-        /// The finger record again, as approved
-        #[arg(long)]
+        /// The subtype again, as approved
+        #[arg(long, value_parser = parse_u16)]
         confirm: Option<u16>,
+        /// Also write the JSON report here (mode 0600)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// DATABASE WRITE (erase). Reclaims the template database's space, which
+    /// deletes never free (`chip::compact`): saves the Linux-owned templates in
+    /// memory, erases flash partition 4, recreates the user storage and the
+    /// Linux users, and stores the templates again. Every other record (the
+    /// Windows user's, test users without a Linux SID) is gone afterwards.
+    /// `--check` only reads and verifies the templates; `--dry-run` prints the
+    /// requests without opening the sensor.
+    ChipCompact {
+        /// File holding the DMI product serial (root-only in sysfs)
+        #[arg(long)]
+        serial_file: Option<PathBuf>,
+        /// Print the requests, send nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Read and verify the templates only; writes nothing
+        #[arg(long)]
+        check: bool,
+        /// "erase-and-restore", as approved
+        #[arg(long)]
+        confirm: Option<String>,
         /// Also write the JSON report here (mode 0600)
         #[arg(long)]
         output: Option<PathBuf>,
@@ -428,48 +446,77 @@ fn main() -> Result<()> {
         Command::ChipDelete {
             serial_file,
             uid,
-            user,
-            finger,
             subtype,
             dry_run,
             confirm,
             output,
         } => {
-            let print = chip::Stored {
-                uid,
-                user,
-                finger,
-                subtype,
-            };
+            let print = chip::Print { uid, subtype };
             if dry_run {
                 return report(
                     &json!({
-                        "finger_request": hex(&db::delete_request(finger)),
-                        "then_if_the_user_record_is_left_empty": hex(&db::delete_request(user)),
-                        "each_followed_by": hex(&db::COMMIT_REQUEST),
+                        "finds": "uid's user record by its SID, then its finger with this subtype",
+                        "sends": "48 <finger record>, 1a; then 48 <user record>, 1a if the user record is left empty",
                     }),
                     output,
                 );
             }
             ensure!(
-                confirm == Some(finger),
-                "--confirm must repeat --finger; nothing was sent"
+                confirm == Some(subtype),
+                "--confirm must repeat --subtype; nothing was sent"
             );
             let serial_file = serial_file.context("--serial-file is required for a real run")?;
             with_sensor(&serial_file, output, |sensor, keys, steps| {
                 let (mut session, _) = device::open_session(&sensor, keys, &mut log(steps))?;
-                let state = |session: &mut syna_00a2::tls::Session| -> Result<Value> {
-                    let info = db::parse_info(&session.cmd_ok(&sensor, &db::info_request())?)?;
-                    let prints = chip::list(session, &sensor)?;
-                    Ok(json!({
-                        "db_info": info,
-                        "linux_prints": prints.iter().map(|p| json!([p.uid, p.user, p.finger, p.subtype])).collect::<Vec<_>>(),
-                    }))
-                };
-                steps.insert("before".into(), state(&mut session)?);
+                steps.insert("before".into(), db_state(&mut session, &sensor)?);
                 let deleted = chip::delete(&mut session, &sensor, &print);
-                steps.insert("after".into(), state(&mut session)?);
+                steps.insert("after".into(), db_state(&mut session, &sensor)?);
                 deleted
+            })
+        }
+        Command::ChipCompact {
+            serial_file,
+            dry_run,
+            check,
+            confirm,
+            output,
+        } => {
+            if dry_run {
+                return report(
+                    &json!({
+                        "reads": "every Linux-owned finger record's value (0x49), rebuilt and checked against its TemplateId, in memory only",
+                        "erase": format!("{} (db_write_enable first, 1a after)", hex(&[0x3f, 4])),
+                        "recreate_user_storage": hex(&db::new_record_request(1, 4, 3, b"StgWindsor\0", &[])),
+                        "then": "each Linux user record (47 03 00 05 00 03 00 4c 00 + identity) and each saved template (47 <user> 06 00 03 00 60 5a + envelope + 00)",
+                    }),
+                    output,
+                );
+            }
+            let serial_file = serial_file.context("--serial-file is required")?;
+            ensure!(
+                check || confirm.as_deref() == Some("erase-and-restore"),
+                "a real run needs --confirm erase-and-restore (or use --check, which writes nothing)"
+            );
+            with_sensor(&serial_file, output, |sensor, keys, steps| {
+                let (mut session, _) = device::open_session(&sensor, keys, &mut log(steps))?;
+                steps.insert("before".into(), db_state(&mut session, &sensor)?);
+                if check {
+                    let saved = chip::saved_templates(&mut session, &sensor)?;
+                    steps.insert(
+                        "saved".into(),
+                        json!(saved.iter().map(|(p, e)| json!({ "uid": p.uid, "subtype": p.subtype, "bytes": e.len(), "sha256": hex(&Sha256::digest(e)) })).collect::<Vec<_>>()),
+                    );
+                    return Ok(());
+                }
+                let done = chip::compact(&mut session, &sensor);
+                if let Ok(c) = &done {
+                    steps.insert(
+                        "compacted".into(),
+                        json!({ "kept": c.kept.iter().map(|p| json!([p.uid, p.subtype])).collect::<Vec<_>>(), "free_before": c.free_before, "free_after": c.free_after }),
+                    );
+                }
+                steps.insert("after".into(), db_state(&mut session, &sensor)?);
+                done.map(drop)
             })
         }
         Command::ChipNewUser {
@@ -1607,6 +1654,16 @@ fn pair_matrix(manifest: &Path, refs_prefix: &str, output: &Path) -> Result<()> 
         }))?
         .as_bytes(),
     )
+}
+
+/// Free space and the Linux-owned prints, for before/after reports
+fn db_state(session: &mut syna_00a2::tls::Session, sensor: &usb::Sensor) -> Result<Value> {
+    let info = db::parse_info(&session.cmd_ok(sensor, &db::info_request())?)?;
+    let prints = chip::list(session, sensor)?;
+    Ok(json!({
+        "db_info": info,
+        "linux_prints": prints.iter().map(|p| json!([p.uid, p.subtype])).collect::<Vec<_>>(),
+    }))
 }
 
 fn parse_u16(s: &str) -> Result<u16, String> {

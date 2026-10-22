@@ -16,7 +16,7 @@
 
 use std::f64::consts::TAU;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -657,7 +657,7 @@ pub fn template_id(ws_body: &[u8]) -> [u8; 32] {
 /// The envelope (byte-identical to the DLL's sub_180036840): subtype,
 /// version 3, payload size, trailer size; TLV 1 = WS body; TLV 2 = TemplateId;
 /// 32 zeros
-fn envelope(subtype: u16, ws_body: &[u8]) -> Vec<u8> {
+pub fn envelope(subtype: u16, ws_body: &[u8]) -> Vec<u8> {
     let tid = template_id(ws_body);
     let payload = 4 + ws_body.len() + 4 + tid.len();
     let mut out = Vec::with_capacity(ENVELOPE_SIZE);
@@ -762,6 +762,30 @@ pub fn template(frames: &[Frame], subtype: u16) -> Vec<u8> {
         .map(|k| frames[k].keypoints.as_slice())
         .collect();
     assemble(&sections, subtype)
+}
+
+/// The envelope a finger record was stored from, rebuilt from the record's
+/// value as the sensor returns it (`0x49`): it finds TLV 1 (the WS body) and
+/// TLV 2 (the TemplateId) and checks the TemplateId against the body, so a
+/// rebuilt envelope is byte-exact or an error.
+pub fn envelope_from_stored(subtype: u16, value: &[u8]) -> Result<Vec<u8>> {
+    let mut tlv1 = vec![1, 0];
+    tlv1.extend((WS_SIZE as u16).to_le_bytes());
+    let tlv2 = [2, 0, 32, 0];
+    let at = (0..value.len())
+        .find(|&i| {
+            value.len() >= i + 8 + WS_SIZE + 32
+                && value[i..].starts_with(&tlv1)
+                && value[i + 4 + WS_SIZE..].starts_with(&tlv2)
+        })
+        .context("no template body in the record value")?;
+    let ws = &value[at + 4..at + 4 + WS_SIZE];
+    let tid = &value[at + 8 + WS_SIZE..at + 8 + WS_SIZE + 32];
+    ensure!(
+        template_id(ws) == tid,
+        "the record's TemplateId doesn't match its body"
+    );
+    Ok(envelope(subtype, ws))
 }
 
 /// [`template`], with the section poses estimated from the frames and the
@@ -877,6 +901,29 @@ mod tests {
         assert_eq!(hex(&envelope[..16]), v["envelope_head"]);
         assert_eq!(hex(&envelope[envelope.len() - 80..]), v["envelope_tail"]);
         assert_eq!(hex(&Sha256::digest(&envelope)), v["envelope_sha256"]);
+    }
+
+    #[test]
+    fn stored_envelopes_are_rebuilt_exactly() {
+        let ws = ws_scaffold(None);
+        let original = envelope(0x03, &ws);
+        // The record value as stored, with a made-up wrapper around it
+        let mut value = vec![0xaa; 24];
+        value.extend(&original[8..original.len() - 32]);
+        value.extend([0x55; 8]);
+        assert_eq!(envelope_from_stored(0x03, &value).unwrap(), original);
+        let tampered = value
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| if i == 600 { b ^ 1 } else { b })
+            .collect::<Vec<_>>();
+        assert!(envelope_from_stored(0x03, &tampered).is_err());
+        assert!(envelope_from_stored(0x03, &value[..1000]).is_err());
+        // Exactly the stored payload, no wrapper
+        assert_eq!(
+            envelope_from_stored(0x03, &original[8..original.len() - 32]).unwrap(),
+            original
+        );
     }
 
     #[test]

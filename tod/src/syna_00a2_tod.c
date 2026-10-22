@@ -31,15 +31,8 @@ enum { SYNA_STATUS_NEEDED = 1, SYNA_STATUS_PRESENT = 2 };
 typedef struct
 {
   guint32 uid;     /* Linux uid in the user record's SID */
-  guint16 user;    /* user record */
-  guint16 finger;  /* finger record */
   guint16 subtype; /* WinBio finger position, 1..10 */
 } SynaPrint;
-typedef struct
-{
-  guint32 user;
-  guint16 subtype;
-} SynaMatch;
 SynaHandle *syna_open (guint8 bus, guint8 address, char **error);
 void syna_close (SynaHandle *handle);
 gsize syna_image_size (void);
@@ -51,10 +44,10 @@ int syna_capture (SynaHandle *handle,
                   char **error);
 int syna_chip_enroll (SynaHandle *handle, guint32 uid, guint16 subtype,
                       const guint8 *images, gsize count, SynaPrint *out, char **error);
-int syna_chip_identify (SynaHandle *handle, guint16 user,
+int syna_chip_identify (SynaHandle *handle, gint64 restrict_uid,
                         int (*is_cancelled) (gpointer user),
                         void (*on_status) (gpointer user, int status),
-                        gpointer status_user, SynaMatch *out, char **error);
+                        gpointer status_user, SynaPrint *out, char **error);
 int syna_chip_list (SynaHandle *handle, SynaPrint **out, gsize *len, char **error);
 void syna_prints_free (SynaPrint *prints, gsize len);
 int syna_chip_delete (SynaHandle *handle, const SynaPrint *print, char **error);
@@ -82,7 +75,7 @@ static const FpIdEntry id_table[] = {
 #define SYNA_OUTCOME_RETRY -2
 
 /* A print's fpi-data: SynaPrint's fields */
-#define SYNA_PRINT_FORMAT "(uqqq)"
+#define SYNA_PRINT_FORMAT "(uq)"
 
 static GError *
 take_error (char *message)
@@ -259,7 +252,7 @@ print_get_stored (FpPrint *print, SynaPrint *out)
   g_object_get (print, "fpi-data", &data, NULL);
   if (!data || !g_variant_check_format_string (data, SYNA_PRINT_FORMAT, FALSE))
     return FALSE;
-  g_variant_get (data, SYNA_PRINT_FORMAT, &out->uid, &out->user, &out->finger, &out->subtype);
+  g_variant_get (data, SYNA_PRINT_FORMAT, &out->uid, &out->subtype);
   return TRUE;
 }
 
@@ -269,7 +262,7 @@ print_set_stored (FpPrint *print, const SynaPrint *stored)
   fpi_print_set_type (print, FPI_PRINT_RAW);
   fpi_print_set_device_stored (print, TRUE);
   g_object_set (print, "fpi-data",
-                g_variant_new (SYNA_PRINT_FORMAT, stored->uid, stored->user, stored->finger, stored->subtype),
+                g_variant_new (SYNA_PRINT_FORMAT, stored->uid, stored->subtype),
                 NULL);
 }
 
@@ -405,8 +398,8 @@ syna_enroll (FpDevice *device)
 
 typedef struct
 {
-  guint16 user;    /* restrict the match to this user record; 0 = all */
-  GArray *prints;  /* SynaPrint per gallery entry, user record 0 if not ours */
+  gint64  uid;     /* restrict the match to this uid's fingers; -1 = any */
+  GArray *prints;  /* SynaPrint per gallery entry, subtype 0 if not ours */
 } MatchData;
 
 static void
@@ -423,9 +416,9 @@ match_thread (GTask *task, gpointer source, gpointer task_data, GCancellable *ca
 {
   FpiDeviceSyna00a2 *self = FPI_DEVICE_SYNA_00A2 (source);
   MatchData *data = task_data;
-  SynaMatch found = { 0 };
+  SynaPrint found = { 0 };
   char *message = NULL;
-  int outcome = syna_chip_identify (self->handle, data->user, is_cancelled, on_status, self, &found, &message);
+  int outcome = syna_chip_identify (self->handle, data->uid, is_cancelled, on_status, self, &found, &message);
 
   if (outcome == SYNA_CANCELLED)
     g_task_return_error (task, cancelled_error ());
@@ -435,19 +428,19 @@ match_thread (GTask *task, gpointer source, gpointer task_data, GCancellable *ca
     g_task_return_int (task, SYNA_OUTCOME_RETRY);
   else
     {
-      /* (user record, subtype) is unique on the sensor, so it names one finger */
+      /* (uid, subtype) names one finger on the sensor */
       for (guint i = 0; outcome == SYNA_MATCH && i < data->prints->len; i++)
         {
           SynaPrint *print = &g_array_index (data->prints, SynaPrint, i);
 
-          if (print->user && print->user == found.user && print->subtype == found.subtype)
+          if (print->subtype && print->uid == found.uid && print->subtype == found.subtype)
             {
               g_task_return_int (task, i);
               return;
             }
         }
       if (outcome == SYNA_MATCH)
-        fp_dbg ("Matched user record %u finger %u, which is not in the gallery", found.user, found.subtype);
+        fp_dbg ("Matched uid %u finger %u, which is not in the gallery", found.uid, found.subtype);
       g_task_return_int (task, SYNA_OUTCOME_NO_MATCH);
     }
 }
@@ -459,6 +452,7 @@ start_match (FpDevice *device, GPtrArray *prints, GAsyncReadyCallback done)
   GTask *task = g_task_new (device, NULL, done, NULL);
   gboolean one_user = TRUE;
 
+  data->uid = -1;
   data->prints = g_array_sized_new (FALSE, TRUE, sizeof (SynaPrint), prints->len);
   for (guint i = 0; i < prints->len; i++)
     {
@@ -466,16 +460,16 @@ start_match (FpDevice *device, GPtrArray *prints, GAsyncReadyCallback done)
 
       if (!print_get_stored (g_ptr_array_index (prints, i), &stored))
         fp_warn ("Skipping a print this driver didn't store");
-      else if (data->user && stored.user != data->user)
+      else if (data->uid >= 0 && stored.uid != data->uid)
         one_user = FALSE;
       else
-        data->user = stored.user;
+        data->uid = stored.uid;
       g_array_append_val (data->prints, stored);
     }
   /* The sensor matches one scan once, so a gallery spanning users is matched
-   * against every user record and filtered here */
+   * against every Linux user and filtered here */
   if (!one_user)
-    data->user = 0;
+    data->uid = -1;
   g_atomic_int_set (&FPI_DEVICE_SYNA_00A2 (device)->cancelling, FALSE);
   g_task_set_task_data (task, data, match_data_free);
   g_task_run_in_thread (task, match_thread);
