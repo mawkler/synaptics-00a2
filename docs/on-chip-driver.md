@@ -220,9 +220,15 @@ touch becomes a single-frame template in a free slot, or replaces the oldest
 (lowest record id). It needs a strong touch (≥ 250 keypoints), compacts first
 if space is short, and never fails the match. List, delete, re-enroll and
 matching treat all of a finger's slots as one print. Nothing is kept on the
-host. Untested on the sensor: that a template built from identify-mode
-touches matches at all (D, the only one tried, was tested on a day nothing
-matched), and that subtypes above 0x0f are accepted.
+host. Verified 2026-10-22 (premise test): identify-mode templates do match
+(4/10 two hours later) and subtypes above 0x0f are accepted.
+
+Known risks (review 2026-10-22, not mitigated in code):
+- A compaction interrupted between the erase and the restore (process killed,
+  suspend) loses the templates; the fingers need enrolling again. Enroll and
+  refresh compact only when space is short, roughly every 20 refreshes.
+- A false accept right after a miss would become a recent template of that
+  finger (template poisoning). No false accept has been seen so far.
 
 ## Implementation steps (after questions 1 to 4)
 

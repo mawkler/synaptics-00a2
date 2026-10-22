@@ -211,6 +211,19 @@ fn free_space(session: &mut Session, sensor: &Sensor) -> Result<u32> {
     Ok(db::parse_info(&session.cmd_ok(sensor, &db::info_request())?)?.free)
 }
 
+/// Makes room for one more template, compacting if the database is short of
+/// space (deletes free none); [`DataFull`] if even that isn't enough
+fn ensure_room(session: &mut Session, sensor: &Sensor) -> Result<()> {
+    const NEEDED: usize = moh::ENVELOPE_SIZE + 4096;
+    if (free_space(session, sensor)? as usize) < NEEDED {
+        compact(session, sensor)?;
+        if (free_space(session, sensor)? as usize) < NEEDED {
+            return Err(DataFull.into());
+        }
+    }
+    Ok(())
+}
+
 /// Recent-touch templates kept per finger besides the enrolled one (see
 /// [`refresh`]). A finger's templates share its WinBio position in the low
 /// nibble of their subtype; the enrolled one is slot 0, recent ones are slots
@@ -250,7 +263,7 @@ fn templates(session: &mut Session, sensor: &Sensor) -> Result<Vec<(u32, u16, db
 /// Builds the template from enroll-mode frames and stores it as the finger
 /// `subtype` of uid's user record, creating the record on first use. Templates
 /// already stored for that finger (an old enrollment and its recent slots)
-/// are replaced.
+/// are replaced. Compacts first if the database is short of space.
 pub fn enroll(
     session: &mut Session,
     sensor: &Sensor,
@@ -263,9 +276,7 @@ pub fn enroll(
         "finger position {subtype} is not a WinBio position"
     );
     let envelope = moh::template(frames, subtype);
-    if (free_space(session, sensor)? as usize) < envelope.len() + 4096 {
-        return Err(DataFull.into());
-    }
+    ensure_room(session, sensor)?;
     let user = user_for(session, sensor, uid)?;
     let (_, fingers) = user_record(session, sensor, user)?;
     for old in fingers.iter().filter(|f| position(f.subtype) == subtype) {
@@ -358,13 +369,8 @@ pub fn refresh(
         "the touch is too weak to keep ({} keypoints)",
         frame.pool
     );
-    if (free_space(session, sensor)? as usize) < moh::ENVELOPE_SIZE + 4096 {
-        compact(session, sensor)?;
-        ensure!(
-            free_space(session, sensor)? as usize >= moh::ENVELOPE_SIZE + 4096,
-            "no room for a recent template even after compacting"
-        );
-    }
+    ensure_room(session, sensor)?;
+    // After a compaction the record ids are new
     let user = find_user(session, sensor, print.uid)?.ok_or(NotFound)?;
     let (_, fingers) = user_record(session, sensor, user)?;
     let taken: Vec<(u16, u16)> = fingers
@@ -410,7 +416,9 @@ pub fn saved_templates(session: &mut Session, sensor: &Sensor) -> Result<Vec<(Pr
 /// Linux-owned templates in memory, erases the template partition (which
 /// also drops every record Linux didn't create), recreates the user storage
 /// and the Linux users, and stores the templates again. If it fails after the
-/// erase, the templates are lost and the fingers need enrolling again.
+/// erase, the templates are lost and the fingers need enrolling again; that
+/// includes the process dying or the laptop suspending in those few seconds.
+/// shortcut: templates live only in memory during the erase, keeping no copy on disk is the price; revisit if a compaction is ever lost
 pub fn compact(session: &mut Session, sensor: &Sensor) -> Result<Compacted> {
     let free_before = free_space(session, sensor)?;
     let saved = saved_templates(session, sensor)?;
