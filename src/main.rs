@@ -138,6 +138,10 @@ enum Command {
         /// being tested.
         #[arg(long, value_delimiter = ',', default_value = "0")]
         match_user: Vec<u16>,
+        /// Or the Linux uids whose user records (found by their SIDs) to match
+        /// against, instead of --match-user
+        #[arg(long, value_delimiter = ',')]
+        match_uid: Vec<u32>,
         /// With several --match-user ids: match each touch against only one
         /// of them, in rotation (touch 1 the first id, touch 2 the second,
         /// ...). The chip allows one match per scan, so this is how to compare
@@ -402,6 +406,7 @@ fn main() -> Result<()> {
             attempts,
             finger_timeout,
             match_user,
+            match_uid,
             alternate,
             save_dir,
             label,
@@ -428,6 +433,7 @@ fn main() -> Result<()> {
                         attempts,
                         finger_timeout: timeout,
                         match_users: match_user,
+                        match_uids: match_uid,
                         alternate,
                     },
                     &cancelled,
@@ -1102,6 +1108,8 @@ struct IdentifyPlan {
     finger_timeout: Duration,
     /// Each scan is matched against these users in turn (0 = every user)
     match_users: Vec<u16>,
+    /// Linux uids to look up and use instead of `match_users`, if any
+    match_uids: Vec<u32>,
     /// Match each scan against one user only, in rotation
     alternate: bool,
 }
@@ -1118,9 +1126,21 @@ fn run_chip_identify(
         attempts,
         finger_timeout,
         ref match_users,
+        ref match_uids,
         alternate,
     } = *plan;
     let mut scanner = device::Scanner::open(sensor, keys, &mut log(steps))?;
+    let mut match_users = match_users.clone();
+    if !match_uids.is_empty() {
+        match_users = match_uids
+            .iter()
+            .map(|&uid| {
+                chip::find_user(&mut scanner.session, &scanner.sensor, uid)?
+                    .with_context(|| format!("uid {uid} has no user record"))
+            })
+            .collect::<Result<_>>()?;
+    }
+    let match_users = &match_users;
     steps.insert("match_users".into(), json!(match_users));
 
     // The stored fingers, by subtype only: user records hold Windows SIDs
