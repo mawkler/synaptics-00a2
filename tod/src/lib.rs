@@ -246,10 +246,15 @@ fn trace(scan: &ScanOutcome) {
 
 /// Appends one JSON line to the file named by SYNA_00A2_TRACE (test runs
 /// only; off unless the variable is set)
-fn note(line: serde_json::Value) {
+fn note(mut line: serde_json::Value) {
     let Some(path) = std::env::var_os("SYNA_00A2_TRACE") else {
         return;
     };
+    // Wall-clock stamp: event times are relative to each scan's start
+    line["at_ms"] = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+        .into();
     let file = fs::OpenOptions::new().create(true).append(true).open(path);
     if let Ok(mut file) = file {
         let _ = writeln!(file, "{line}");
