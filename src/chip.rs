@@ -286,22 +286,11 @@ pub fn enroll(
     Ok(Print { uid, subtype })
 }
 
-/// The chip's match of the last identify-mode scan, against uid's user
-/// record only, or every user with None. Returns the matched print if the
+/// The chip's match of the last identify-mode scan, against one user record
+/// (0 = every user; see [`find_user`]). Returns the matched print if the
 /// finger is a Linux-owned one (a match of anything else is no match), with
 /// the matched template's own subtype, which tells its slot.
-pub fn identify(
-    session: &mut Session,
-    sensor: &Sensor,
-    uid: Option<u32>,
-) -> Result<Option<(Print, u16)>> {
-    let user = match uid {
-        Some(uid) => match find_user(session, sensor, uid)? {
-            Some(user) => user,
-            None => return Ok(None),
-        },
-        None => 0,
-    };
+pub fn identify(session: &mut Session, sensor: &Sensor, user: u16) -> Result<Option<(Print, u16)>> {
     let Some(result) = chip_match(session, sensor, user)?.result else {
         return Ok(None);
     };

@@ -323,6 +323,13 @@ pub unsafe extern "C" fn syna_chip_identify(
         // SAFETY: the C side passes the handle from syna_open, used by one thread at a time
         let handle = unsafe { handle.as_mut() }.context("the device is not open")?;
         let cancelled = || is_cancelled(status_user) != 0;
+        // Look the user record up before the scan: the first database lookup
+        // after opening, sent between the scan and the match, lost the match
+        // (the first touch of every driver run missed until 2026-10-23)
+        let user = match u32::try_from(restrict_uid) {
+            Ok(uid) => chip::find_user(&mut handle.scanner.session, &handle.scanner.sensor, uid)?,
+            Err(_) => Some(0),
+        };
         let outcome = handle.scanner.scan(
             calibrate::Mode::Identify,
             FINGER_TIMEOUT,
@@ -338,9 +345,11 @@ pub unsafe extern "C" fn syna_chip_identify(
             Err(e) => return Err(e),
         };
         let scanner = &mut handle.scanner;
-        let uid = u32::try_from(restrict_uid).ok();
-        let Some((print, matched)) = chip::identify(&mut scanner.session, &scanner.sensor, uid)?
-        else {
+        let found = match user {
+            Some(user) => chip::identify(&mut scanner.session, &scanner.sensor, user)?,
+            None => None,
+        };
+        let Some((print, matched)) = found else {
             handle.last_miss = Some(Instant::now());
             note(serde_json::json!({ "match": null }));
             return Ok(SYNA_NO_MATCH);
