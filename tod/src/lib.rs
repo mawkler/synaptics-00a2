@@ -154,7 +154,13 @@ pub unsafe extern "C" fn syna_open(
     guard(error, ptr::null_mut(), || {
         let keys = host_keys()?;
         let sensor = usb::Sensor::open_at(bus, address)?;
-        let scanner = Scanner::open(sensor, &keys, &mut |_, _| {})?;
+        // One journal line per calibration, to explain failures in real use
+        let scanner = Scanner::open(sensor, &keys, &mut |name, value| {
+            if name.starts_with("calibration") {
+                let diff = &value["blank_vs_partition6_mean_abs_diff"];
+                eprintln!("syna_00a2: {name}: blank vs clean slate {diff}");
+            }
+        })?;
         Ok(Box::into_raw(Box::new(SynaHandle {
             scanner,
             last_miss: None,
@@ -338,17 +344,28 @@ pub unsafe extern "C" fn syna_chip_identify(
             || on_status(status_user, SYNA_STATUS_PRESENT),
         );
         trace(&outcome);
+        let (held, stalled) = (outcome.held, outcome.stalled);
         let image = match outcome.result {
             Ok(Scan::Image(image)) => image,
-            Ok(Scan::Rejected(_)) => return Ok(SYNA_RETRY),
+            Ok(Scan::Rejected(code)) => {
+                eprintln!("syna_00a2: touch rejected ({code:#x})");
+                return Ok(SYNA_RETRY);
+            }
             Err(_) if cancelled() => return Ok(SYNA_CANCELLED),
-            Err(e) => return Err(e),
+            Err(e) => {
+                eprintln!("syna_00a2: scan failed: {e:#}");
+                return Err(e);
+            }
         };
         let scanner = &mut handle.scanner;
         let found = match user {
             Some(user) => chip::identify(&mut scanner.session, &scanner.sensor, user)?,
             None => None,
         };
+        eprintln!(
+            "syna_00a2: touch: {} (held {held}, stalled {stalled})",
+            found.map_or("no match".to_owned(), |(_, m)| format!("match {m:#x}"))
+        );
         let Some((print, matched)) = found else {
             handle.last_miss = Some(Instant::now());
             note(serde_json::json!({ "match": null }));
