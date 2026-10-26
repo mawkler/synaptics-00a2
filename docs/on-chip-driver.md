@@ -229,6 +229,11 @@ Known risks (review 2026-10-22, not mitigated in code):
   refresh compact only when space is short, roughly every 20 refreshes.
 - A false accept right after a miss would become a recent template of that
   finger (template poisoning). No false accept has been seen so far.
+- Oldest-first can evict the most useful slot: on 2026-10-26 a refresh
+  replaced a template that had matched 3 times earlier in the same run.
+  Evicting the least recently *matched* slot would be better, but needs that
+  time stored somewhere (fprintd restarts the driver often). Not changed while
+  the daily rate holds at 8 to 9 of 10.
 
 ## Implementation steps (after questions 1 to 4)
 
