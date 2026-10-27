@@ -218,7 +218,10 @@ subtype = finger position + 0x10 × slot. When a match comes within 2 minutes
 of a miss (the finger reads differently from what is stored), the matching
 touch becomes a single-frame template in a free slot, or replaces the oldest
 (lowest record id). It needs a strong touch (≥ 250 keypoints), compacts first
-if space is short, and never fails the match. List, delete, re-enroll and
+if space is short, and never fails the match. The miss is remembered by the
+process, not the open reader (fprintd reopens it for each login attempt), and
+a process refreshes at most once, so the slots span several sittings (on
+2026-10-27 all three came from one evening and 1 of 18 touches matched). List, delete, re-enroll and
 matching treat all of a finger's slots as one print. Nothing is kept on the
 host. Verified 2026-10-22 (premise test): identify-mode templates do match
 (4/10 two hours later) and subtypes above 0x0f are accepted.

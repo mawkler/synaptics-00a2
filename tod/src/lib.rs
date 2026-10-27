@@ -10,6 +10,10 @@ use std::{
     io::Write,
     panic::{catch_unwind, AssertUnwindSafe},
     ptr, slice,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -76,9 +80,17 @@ pub type StatusFn = extern "C" fn(*mut c_void, c_int);
 /// now
 const REFRESH_AFTER_MISS: Duration = Duration::from_secs(120);
 
+/// The last miss, kept by the process rather than the open reader: fprintd
+/// opens the reader anew for each login attempt, often for a single touch
+static LAST_MISS: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// At most one refresh per process (a panel run, or fprintd's lifetime at a
+/// lock screen), so the recent slots keep templates from several sittings.
+/// On 2026-10-27 all three came from one evening and nothing matched
+static REFRESHED: AtomicBool = AtomicBool::new(false);
+
 pub struct SynaHandle {
     scanner: Scanner,
-    last_miss: Option<Instant>,
 }
 
 extern "C" {
@@ -161,10 +173,7 @@ pub unsafe extern "C" fn syna_open(
                 eprintln!("syna_00a2: {name}: blank vs clean slate {diff}");
             }
         })?;
-        Ok(Box::into_raw(Box::new(SynaHandle {
-            scanner,
-            last_miss: None,
-        })))
+        Ok(Box::into_raw(Box::new(SynaHandle { scanner })))
     })
 }
 
@@ -367,19 +376,24 @@ pub unsafe extern "C" fn syna_chip_identify(
             found.map_or("no match".to_owned(), |(_, m)| format!("match {m:#x}"))
         );
         let Some((print, matched)) = found else {
-            handle.last_miss = Some(Instant::now());
+            *LAST_MISS.lock().unwrap() = Some(Instant::now());
             note(serde_json::json!({ "match": null }));
             return Ok(SYNA_NO_MATCH);
         };
         note(serde_json::json!({ "match": format!("{matched:#x}") }));
-        if handle
-            .last_miss
+        let after_miss = LAST_MISS
+            .lock()
+            .unwrap()
             .take()
-            .is_some_and(|miss| miss.elapsed() < REFRESH_AFTER_MISS)
-        {
+            .is_some_and(|miss| miss.elapsed() < REFRESH_AFTER_MISS);
+        if after_miss && REFRESHED.load(Ordering::Relaxed) {
+            eprintln!("syna_00a2: refresh skipped: already refreshed in this process");
+            note(serde_json::json!({ "refresh_skipped": "already refreshed in this process" }));
+        } else if after_miss {
             // Never fails the match: the refresh is a side effect
             match chip::refresh(&mut scanner.session, &scanner.sensor, &print, &image.pixels) {
                 Ok(subtype) => {
+                    REFRESHED.store(true, Ordering::Relaxed);
                     eprintln!(
                         "syna_00a2: refreshed uid {} as subtype {subtype:#x}",
                         print.uid
