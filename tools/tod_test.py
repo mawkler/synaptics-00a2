@@ -43,6 +43,7 @@ def main():
     parser.add_argument('--serial-file', required=True, help='private copy of the DMI serial (sysfs needs root)')
     parser.add_argument('--output', help='also write the JSON report here (0600)')
     parser.add_argument('--trace', help="have the driver append each scan's raw events here (SYNA_00A2_TRACE)")
+    parser.add_argument('--no-refresh', action='store_true', help='never refresh templates after a miss (SYNA_00A2_NO_REFRESH)')
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('enroll')
     p.add_argument('--out', required=True)
@@ -65,6 +66,8 @@ def main():
     os.environ['SYNA_00A2_SERIAL_FILE'] = os.path.abspath(args.serial_file)
     if args.trace:
         os.environ['SYNA_00A2_TRACE'] = os.path.abspath(args.trace)
+    if args.no_refresh:
+        os.environ['SYNA_00A2_NO_REFRESH'] = '1'
 
     import gi
     gi.require_version('FPrint', '2.0')

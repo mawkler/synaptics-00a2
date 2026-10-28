@@ -385,7 +385,9 @@ pub unsafe extern "C" fn syna_chip_identify(
             .lock()
             .unwrap()
             .take()
-            .is_some_and(|miss| miss.elapsed() < REFRESH_AFTER_MISS);
+            .is_some_and(|miss| miss.elapsed() < REFRESH_AFTER_MISS)
+            // Test runs that only measure leave the templates alone
+            && std::env::var_os("SYNA_00A2_NO_REFRESH").is_none();
         if after_miss && REFRESHED.load(Ordering::Relaxed) {
             eprintln!("syna_00a2: refresh skipped: already refreshed in this process");
             note(serde_json::json!({ "refresh_skipped": "already refreshed in this process" }));
