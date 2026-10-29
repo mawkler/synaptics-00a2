@@ -227,8 +227,10 @@ fn ensure_room(session: &mut Session, sensor: &Sensor) -> Result<()> {
 /// Recent-touch templates kept per finger besides the enrolled one (see
 /// [`refresh`]). A finger's templates share its WinBio position in the low
 /// nibble of their subtype; the enrolled one is slot 0, recent ones are slots
-/// 1..=RECENT_SLOTS (subtype + 0x10 × slot).
-pub const RECENT_SLOTS: u16 = 3;
+/// 1..=RECENT_SLOTS (subtype + 0x10 × slot). Each holds one placement, and
+/// with three a day's refreshes pushed out all earlier days (2026-10-29: 2/10
+/// next morning). Eight fill about 9 of the ~21 templates the storage holds.
+pub const RECENT_SLOTS: u16 = 8;
 
 fn position(subtype: u16) -> u16 {
     subtype & 0x0f
@@ -456,6 +458,10 @@ mod tests {
         assert_eq!(next_slot(&[(1, 30)]), 2);
         assert_eq!(next_slot(&[(1, 30), (3, 31)]), 2);
         // All taken: the lowest record id is the oldest
-        assert_eq!(next_slot(&[(1, 40), (2, 35), (3, 38)]), 2);
+        let full: Vec<_> = (1..=RECENT_SLOTS).map(|s| (s, 40 + s)).collect();
+        assert_eq!(next_slot(&full), 1);
+        let mut full = full;
+        full[4].1 = 35;
+        assert_eq!(next_slot(&full), 5);
     }
 }

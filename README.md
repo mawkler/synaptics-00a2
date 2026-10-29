@@ -4,7 +4,7 @@ Experimental Linux driver for the Synaptics 06cb:00a2 fingerprint reader (tested
 
 - Fingerprint templates live on the sensor, which does the matching. The host keeps only (uid, finger), with no images.
 - It reuses the sensor's existing pairing. The keys derive from the laptop's DMI product name and serial.
-- After a miss followed by a match, the driver stores the matching touch as a fresh template (up to 3 per finger), so it keeps up with day-to-day changes.
+- After a miss followed by a match, the driver stores the matching touch as a fresh template (up to 8 per finger), so it keeps up with day-to-day changes.
 
 ## Install (NixOS flake)
 

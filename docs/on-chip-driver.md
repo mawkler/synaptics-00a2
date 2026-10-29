@@ -213,7 +213,7 @@ Cross-day tests: a template matches its own day's touches (10/10) but only
 about 25 % the next day, while the next day's touches resemble the previous
 day's *login* touches strongly (median 30 descriptor-consistent candidates
 against 5 for the enrollment captures). So the driver keeps up to
-`chip::RECENT_SLOTS` (3) recent templates per finger besides the enrolled one:
+`chip::RECENT_SLOTS` (8, was 3 until 2026-10-29) recent templates per finger besides the enrolled one:
 subtype = finger position + 0x10 × slot. When a match comes within 2 minutes
 of a miss (the finger reads differently from what is stored), the matching
 touch becomes a single-frame template in a free slot, or replaces the oldest
