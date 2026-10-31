@@ -20,9 +20,10 @@ use anyhow::{ensure, Context, Result};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-use crate::matcher::SIDE;
 use crate::pose::{choose_registered, Pose};
 
+/// Frames are SIDE×SIDE 8-bit pixels
+pub const SIDE: usize = 112;
 /// Envelope size: 8-byte header, tag-1 WS body, tag-2 template id, 32 zeros
 pub const ENVELOPE_SIZE: usize = 8 + 4 + WS_SIZE + 4 + 32 + 32;
 /// Record type the envelope is stored as

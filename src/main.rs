@@ -4,7 +4,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use syna_00a2::pose;
 use syna_00a2::{
-    blobs, calibrate, capture, chip, db, device, matcher, moh, pairing, proto, tables, usb,
+    blobs, calibrate, capture, chip, db, device, moh, pairing, proto, tables, usb,
 };
 
 #[derive(Parser)]
@@ -336,19 +336,6 @@ enum Command {
         #[arg(long, requires = "poses")]
         identity_header: bool,
     },
-    /// Offline: scores probe images against a template built from enrolled
-    /// images, as the driver's matcher does. Prints scores only.
-    Score {
-        /// 112×112 PGMs to build the template from
-        #[arg(long, num_args = 1.., required = true)]
-        enroll: Vec<PathBuf>,
-        /// 112×112 PGMs to score
-        #[arg(long, num_args = 1.., required = true)]
-        probe: Vec<PathBuf>,
-        /// Image preparation: "default", "raw", or "SMOOTHxWINDOW" (e.g. 3x15)
-        #[arg(long, default_value = "default")]
-        prepare: String,
-    },
 }
 
 type Decoder = fn(&[u8]) -> Result<Value>;
@@ -390,11 +377,6 @@ fn main() -> Result<()> {
         } => with_sensor(&serial_file, output, |sensor, keys, steps| {
             run_calibrate(sensor, keys, steps, &out_dir)
         }),
-        Command::Score {
-            enroll,
-            probe,
-            prepare,
-        } => score(&enroll, &probe, &prepare),
         Command::ChipTemplate {
             images,
             subtype,
@@ -1373,43 +1355,6 @@ fn run_capture(
     failure.map_or(Ok(()), Err)
 }
 
-fn score(enroll: &[PathBuf], probes: &[PathBuf], prepare: &str) -> Result<()> {
-    let how = match prepare {
-        "default" => matcher::PREPARE,
-        "raw" => matcher::Prepare::Raw,
-        spec => {
-            let (smooth, window) = spec
-                .split_once('x')
-                .context("--prepare SMOOTHxWINDOW, e.g. 3x15")?;
-            matcher::Prepare::Normalise {
-                smooth: smooth.parse()?,
-                window: window.parse()?,
-            }
-        }
-    };
-    let template = matcher::Template {
-        images: enroll.iter().map(|p| read_pgm(p)).collect::<Result<_>>()?,
-    };
-    let started = std::time::Instant::now();
-    let matcher = matcher::Matcher::with(&template, how);
-    for path in probes {
-        let score = matcher.score(&read_pgm(path)?);
-        println!(
-            "{:.3} {}",
-            score,
-            path.file_name().unwrap_or_default().to_string_lossy()
-        );
-    }
-    eprintln!(
-        "{} probes against {} images in {:.2} s; threshold {}",
-        probes.len(),
-        template.images.len(),
-        started.elapsed().as_secs_f64(),
-        matcher::THRESHOLD
-    );
-    Ok(())
-}
-
 fn chip_template(
     images: &[PathBuf],
     subtype: u16,
@@ -1718,7 +1663,7 @@ fn parse_u16(s: &str) -> Result<u16, String> {
 /// Pixels of a 112×112 8-bit binary PGM as written by `pgm`
 fn read_pgm(path: &Path) -> Result<Vec<u8>> {
     let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let header = format!("P5\n{0} {0}\n255\n", matcher::SIDE);
+    let header = format!("P5\n{0} {0}\n255\n", moh::SIDE);
     ensure!(
         data.starts_with(header.as_bytes()),
         "{} is not a 112×112 PGM from this tool",
@@ -1726,7 +1671,7 @@ fn read_pgm(path: &Path) -> Result<Vec<u8>> {
     );
     let pixels = data[header.len()..].to_vec();
     ensure!(
-        pixels.len() == matcher::SIDE * matcher::SIDE,
+        pixels.len() == moh::SIDE * moh::SIDE,
         "{} is truncated",
         path.display()
     );
@@ -1749,14 +1694,16 @@ fn report(value: &Value, output: Option<PathBuf>) -> Result<()> {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(path)
-        .with_context(|| format!("writing {}", path.display()))?
-        .write_all(bytes)?;
+        .with_context(|| format!("writing {}", path.display()))?;
+    // The mode only applies to a new file; an existing one keeps its own
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)?;
     Ok(())
 }
 

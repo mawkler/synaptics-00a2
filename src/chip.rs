@@ -4,7 +4,7 @@
 //! python-validity's SID scheme ([`db::linux_identity`]), with the user's
 //! fingers under it, and the chip's own matching. Records Linux didn't create,
 //! such as the Windows user, are never listed, matched as a success or
-//! deleted.
+//! deleted, except by an explicit [`compact`] (CLI `chip-compact`).
 
 use std::{fmt, time::Duration};
 
@@ -212,10 +212,23 @@ fn free_space(session: &mut Session, sensor: &Sensor) -> Result<u32> {
 }
 
 /// Makes room for one more template, compacting if the database is short of
-/// space (deletes free none); [`DataFull`] if even that isn't enough
+/// space (deletes free none); [`DataFull`] if even that isn't enough, or if
+/// compacting would erase records Linux didn't create (only an explicit
+/// `chip-compact` does that)
 fn ensure_room(session: &mut Session, sensor: &Sensor) -> Result<()> {
     const NEEDED: usize = moh::ENVELOPE_SIZE + 4096;
-    if (free_space(session, sensor)? as usize) < NEEDED {
+    let info = db::parse_info(&session.cmd_ok(sensor, &db::info_request())?)?;
+    if (info.free as usize) < NEEDED {
+        // A delete lowers `used` but not `free` (2026-10-21), so compacting
+        // reclaims at most total − used
+        if (info.total.saturating_sub(info.used) as usize) < NEEDED {
+            return Err(DataFull.into());
+        }
+        for (user, _) in storage(session, sensor)?.users {
+            if user_record(session, sensor, user)?.0.is_none() {
+                return Err(DataFull.into());
+            }
+        }
         compact(session, sensor)?;
         if (free_space(session, sensor)? as usize) < NEEDED {
             return Err(DataFull.into());

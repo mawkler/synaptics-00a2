@@ -23,7 +23,7 @@ use syna_00a2::{
     capture::Scan,
     chip::{self, DataFull, NotFound, Print},
     device::{self, ScanOutcome, Scanner},
-    matcher, moh,
+    moh,
     pairing::HostKeys,
     usb,
 };
@@ -75,9 +75,9 @@ pub type CancelledFn = extern "C" fn(*mut c_void) -> c_int;
 pub type StatusFn = extern "C" fn(*mut c_void, c_int);
 
 /// A match this soon after a miss refreshes the matched finger's templates
-/// (see `chip::refresh`): a miss then a match is the finger reading
-/// differently from what is stored, and the matching touch shows how it reads
-/// now
+/// (see `chip::refresh`) when SYNA_00A2_REFRESH is set: a miss then a match
+/// is the finger reading differently from what is stored, and the matching
+/// touch shows how it reads now
 const REFRESH_AFTER_MISS: Duration = Duration::from_secs(120);
 
 /// The last miss, kept by the process rather than the open reader: fprintd
@@ -190,7 +190,7 @@ pub unsafe extern "C" fn syna_close(handle: *mut SynaHandle) {
 
 #[no_mangle]
 pub extern "C" fn syna_image_size() -> usize {
-    matcher::SIDE * matcher::SIDE
+    moh::SIDE * moh::SIDE
 }
 
 /// One placement. Writes `syna_image_size()` pixels to `image` and returns
@@ -386,8 +386,9 @@ pub unsafe extern "C" fn syna_chip_identify(
             .unwrap()
             .take()
             .is_some_and(|miss| miss.elapsed() < REFRESH_AFTER_MISS)
-            // Test runs that only measure leave the templates alone
-            && std::env::var_os("SYNA_00A2_NO_REFRESH").is_none();
+            // Opt-in: a false accept right after a miss would be stored as a
+            // template of that finger and keep matching the wrong finger
+            && std::env::var_os("SYNA_00A2_REFRESH").is_some();
         if after_miss && REFRESHED.load(Ordering::Relaxed) {
             eprintln!("syna_00a2: refresh skipped: already refreshed in this process");
             note(serde_json::json!({ "refresh_skipped": "already refreshed in this process" }));

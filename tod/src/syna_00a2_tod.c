@@ -156,6 +156,26 @@ on_status (gpointer user, int status)
   invoke (FP_DEVICE (user), report_status_cb, report);
 }
 
+/* Probe: the USB serial is the device id, as in libfprint's synaptics driver.
+ * With libfprint's default "0", fprintd would hand this laptop's prints to
+ * any other 00a2 that someone paired with its DMI serial and plugged in. */
+
+static void
+syna_probe (FpDevice *device)
+{
+  GUsbDevice *usb = fpi_device_get_usb_device (device);
+  g_autofree char *serial = NULL;
+  GError *error = NULL;
+
+  if (g_usb_device_open (usb, &error))
+    {
+      serial = g_usb_device_get_string_descriptor (usb, g_usb_device_get_serial_number_index (usb), &error);
+      g_usb_device_close (usb, NULL);
+    }
+  /* No serial, no device: falling back to "0" would undo the point */
+  fpi_device_probe_complete (device, serial, NULL, error);
+}
+
 /* Open and close */
 
 static void
@@ -717,6 +737,7 @@ fpi_device_syna_00a2_class_init (FpiDeviceSyna00a2Class *klass)
   /* A press sensor that idles between scans: no heating model */
   dev_class->temp_hot_seconds = -1;
 
+  dev_class->probe = syna_probe;
   dev_class->open = syna_open_device;
   dev_class->close = syna_close_device;
   dev_class->enroll = syna_enroll;

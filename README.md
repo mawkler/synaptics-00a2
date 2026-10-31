@@ -4,7 +4,8 @@ Experimental Linux driver for the Synaptics 06cb:00a2 fingerprint reader (tested
 
 - Fingerprint templates live on the sensor, which does the matching. The host keeps only (uid, finger), with no images.
 - It reuses the sensor's existing pairing. The keys derive from the laptop's DMI product name and serial.
-- After a miss followed by a match, the driver stores the matching touch as a fresh template (up to 8 per finger), so it keeps up with day-to-day changes.
+- Optional, off by default: with `SYNA_00A2_REFRESH=1` in fprintd's environment, a match right after a miss stores the matching touch as a fresh template (up to 8 per finger), so it keeps up with day-to-day changes. The risk: a false accept right after a miss becomes a template, and keeps matching that other finger until newer refreshes replace it.
+- It never erases records it didn't create (such as Windows Hello fingers) on its own. Only an explicit `syna-00a2 chip-compact` does that.
 
 ## Install (NixOS flake)
 
@@ -18,6 +19,8 @@ services.fprintd.tod = {
   enable = true;
   driver = inputs.syna-00a2.packages.${pkgs.stdenv.hostPlatform.system}.default;
 };
+# Optional: template refresh (see the risk above)
+systemd.services.fprintd.environment.SYNA_00A2_REFRESH = "1";
 ```
 
 Then enroll with `fprintd-enroll -f right-index-finger`. Logs: `journalctl -u fprintd | rg syna_00a2`.

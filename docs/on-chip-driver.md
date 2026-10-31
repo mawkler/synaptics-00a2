@@ -1,7 +1,7 @@
 # On-chip matching driver: design (draft, 2026-10-19)
 
 The TOD driver today keeps templates on the host and matches them with the
-correlation matcher (`src/matcher.rs`). That matcher fails across days. The
+correlation matcher (`src/matcher.rs`, since removed). That matcher fails across days. The
 sensor's own matcher works: a template built on the host from four
 same-session placements (`src/moh.rs`), stored with `0x47`, matched 8/8 of
 the right middle and 0/3 of other fingers (2026-10-19, record 9). This
@@ -84,8 +84,12 @@ same user. `clear_storage` stays unimplemented.
   prints that compare equal to the enrolled ones.
 - The host holds **no biometric data**: no images and no envelope, only
   identifiers.
-- The device id stays libfprint's default "0" unless a stable per-sensor id
-  is found (open question 7).
+- The device id is the reader's USB serial string, read in `probe`, as in
+  libfprint's synaptics driver (since 2026-10-31; before, libfprint's default
+  "0"). With "0", fprintd handed this laptop's prints to any other 00a2 that
+  someone paired with its DMI serial and plugged in. Prints enrolled under
+  "0" need enrolling again. Assumed unique per reader; not checked against a
+  second 00a2.
 
 ## Operations
 
@@ -129,7 +133,8 @@ Each write follows a fixed sequence:
 - Then the writes: `db_write_enable`, the write command, `0x1a`.
 - Then read again to confirm.
 
-Verify, identify and list never write. The partition currently has 452 KB
+Verify, identify and list never write, except the opt-in refresh
+(`SYNA_00A2_REFRESH`, see below). The partition currently has 452 KB
 free, room for about 19 templates.
 
 ## Open questions, each a separate experiment
@@ -230,8 +235,14 @@ Known risks (review 2026-10-22, not mitigated in code):
 - A compaction interrupted between the erase and the restore (process killed,
   suspend) loses the templates; the fingers need enrolling again. Enroll and
   refresh compact only when space is short, roughly every 20 refreshes.
+  Since 2026-10-31 they don't compact when compacting can't make room
+  (total − used too small) or when a record Linux didn't create would be
+  erased (they report the database as full instead); `chip-compact` still
+  can.
 - A false accept right after a miss would become a recent template of that
-  finger (template poisoning). No false accept has been seen so far.
+  finger (template poisoning). No false accept has been seen so far. Since
+  2026-10-31 refresh is opt-in (`SYNA_00A2_REFRESH`) for this reason;
+  `tod_test.py --refresh` sets it.
 - Oldest-first can evict the most useful slot: on 2026-10-26 a refresh
   replaced a template that had matched 3 times earlier in the same run.
   Evicting the least recently *matched* slot would be better, but needs that
