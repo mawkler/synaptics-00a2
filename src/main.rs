@@ -1444,16 +1444,40 @@ fn probe_score(
     )
 }
 
+/// A frame's keypoints: extracted from a PGM, or read from a JSON list of
+/// `[x, y, descriptor hex]` (another extractor's output, for comparisons)
+fn keypoints_from(path: &Path) -> Result<Vec<moh::Keypoint>> {
+    if path.extension().is_some_and(|e| e == "json") {
+        let list: Vec<(i64, i64, String)> = serde_json::from_slice(&fs::read(path)?)?;
+        return list
+            .into_iter()
+            .map(|(x, y, d)| {
+                let bytes = (0..32)
+                    .step_by(2)
+                    .map(|i| Ok(u8::from_str_radix(d.get(i..i + 2).context("descriptor")?, 16)?))
+                    .collect::<Result<Vec<u8>>>()?;
+                Ok(moh::Keypoint {
+                    x,
+                    y,
+                    orientation: 0.0,
+                    descriptor: bytes.try_into().map_err(|_| anyhow::anyhow!("16 bytes"))?,
+                })
+            })
+            .collect();
+    }
+    Ok(moh::extract(&read_pgm(path)?)?.keypoints)
+}
+
 fn repeat_report(manifest: &Path, output: &Path) -> Result<()> {
     let manifest: Value = serde_json::from_slice(&fs::read(manifest)?)?;
     let groups = manifest["groups"].as_object().context("no groups")?;
-    let mut frames: Vec<(String, Vec<moh::Frame>)> = Vec::new();
+    let mut frames: Vec<(String, Vec<Vec<moh::Keypoint>>)> = Vec::new();
     for (name, paths) in groups {
         let list = paths
             .as_array()
             .context("a group is a list of paths")?
             .iter()
-            .map(|p| moh::extract(&read_pgm(Path::new(p.as_str().context("path")?))?))
+            .map(|p| keypoints_from(Path::new(p.as_str().context("path")?)))
             .collect::<Result<Vec<_>>>()?;
         frames.push((name.clone(), list));
     }
@@ -1476,7 +1500,7 @@ fn repeat_report(manifest: &Path, output: &Path) -> Result<()> {
                         s.spawn(move || {
                             part.iter()
                                 .map(|&(a, b)| {
-                                    pose::register(&fi[a].keypoints, &fj[b].keypoints)
+                                    pose::register(&fi[a], &fj[b])
                                         .map_or(0, |p| p.candidates)
                                 })
                                 .collect::<Vec<u8>>()
