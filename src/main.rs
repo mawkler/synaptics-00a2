@@ -335,6 +335,11 @@ enum Command {
         /// near-identity header (the control for --poses)
         #[arg(long, requires = "poses")]
         identity_header: bool,
+        /// Another extractor's keypoints, one JSON file per image in the same
+        /// order (`[x, y, descriptor hex]`): the same placements are chosen
+        /// from the images, but their sections hold these keypoints
+        #[arg(long, num_args = 1.., conflicts_with = "poses")]
+        keypoints: Vec<PathBuf>,
     },
 }
 
@@ -383,7 +388,8 @@ fn main() -> Result<()> {
             out,
             poses,
             identity_header,
-        } => chip_template(&images, subtype, &out, poses, identity_header),
+            keypoints,
+        } => chip_template(&images, subtype, &out, poses, identity_header, &keypoints),
         Command::ChipIdentify {
             serial_file,
             attempts,
@@ -1361,7 +1367,12 @@ fn chip_template(
     out: &Path,
     poses: bool,
     identity_header: bool,
+    keypoints: &[PathBuf],
 ) -> Result<()> {
+    ensure!(
+        keypoints.is_empty() || keypoints.len() == images.len(),
+        "--keypoints needs one file per image"
+    );
     let frames = images
         .iter()
         .map(|p| moh::extract(&read_pgm(p)?))
@@ -1369,8 +1380,16 @@ fn chip_template(
     let (envelope, chosen) = if poses {
         moh::template_with_poses(&frames, subtype, !identity_header)
             .context("no four placements register against each other")?
-    } else {
+    } else if keypoints.is_empty() {
         (moh::template(&frames, subtype), moh::choose(&frames))
+    } else {
+        let chosen = moh::choose(&frames);
+        let sections = chosen
+            .iter()
+            .map(|&k| keypoints_from(&keypoints[k]))
+            .collect::<Result<Vec<_>>>()?;
+        let refs: Vec<&[moh::Keypoint]> = sections.iter().map(Vec::as_slice).collect();
+        (moh::assemble(&refs, subtype), chosen)
     };
     write_private(out, &envelope)?;
     let name = |p: &PathBuf| {
