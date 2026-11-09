@@ -156,10 +156,10 @@ on_status (gpointer user, int status)
   invoke (FP_DEVICE (user), report_status_cb, report);
 }
 
-/* No probe: with libfprint-tod 1.94.9 a probe that completes crashes in
- * fp_device_task_return_in_idle_cb (g_cancellable_finalize) during device
- * enumeration, 2026-11-09, so fprintd never saw the reader. The device id
- * stays libfprint's default "0", which the enrolled prints carry. */
+/* No probe: the device id stays libfprint's default "0", which the enrolled
+ * prints carry. A probe that set the USB serial as the id (2026-10-31)
+ * orphaned them, so fprintd found no enrolled finger and never opened the
+ * reader. */
 
 /* Open and close */
 
